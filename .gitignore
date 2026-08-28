@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .direnv/
 .vscode/browse.vc.db*
+.claude/worktrees/
