@@ -1,0 +1,28 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${workspaceFolder}/.vscode/browse.vc.db",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/home/bhavya-shah/Projects/ros2_ws/install/table_tennis_gazebo/include/**",
+        "/home/bhavya-shah/Projects/ros2_ws/install/franka_robot_state_broadcaster/include/**",
+        "/home/bhavya-shah/Projects/ros2_ws/install/franka_mobile_example_controllers/include/**",
+        "/home/bhavya-shah/Projects/ros2_ws/install/franka_example_controllers/include/**",
+        "/home/bhavya-shah/Projects/ros2_ws/install/franka_semantic_components/include/**",
+        "/home/bhavya-shah/Projects/ros2_ws/install/franka_gz_ros2_control/include/**",
+        "/home/bhavya-shah/Projects/ros2_ws/install/franka_hardware/include/**",
+        "/home/bhavya-shah/Projects/ros2_ws/install/franka_msgs/include/**",
+        "/opt/ros/jazzy/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ros2",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++17"
+    }
+  ],
+  "version": 4
+}

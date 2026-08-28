@@ -1,0 +1,5 @@
+llm/
+output/
+__pycache__/
+*.pyc
+.direnv/

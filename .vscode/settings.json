@@ -1,0 +1,15 @@
+{
+    "ROS2.distro": "jazzy",
+    "python.autoComplete.extraPaths": [
+        "/home/bhavya-shah/Projects/ros2_ws/install/table_tennis_gazebo/lib/python3.12/site-packages",
+        "/home/bhavya-shah/Projects/ros2_ws/install/franka_gripper/lib/python3.12/site-packages",
+        "/home/bhavya-shah/Projects/ros2_ws/install/franka_msgs/lib/python3.12/site-packages",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/bhavya-shah/Projects/ros2_ws/install/table_tennis_gazebo/lib/python3.12/site-packages",
+        "/home/bhavya-shah/Projects/ros2_ws/install/franka_gripper/lib/python3.12/site-packages",
+        "/home/bhavya-shah/Projects/ros2_ws/install/franka_msgs/lib/python3.12/site-packages",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ]
+}
