@@ -56,6 +56,12 @@ ARCHITECTURE = "decoder-only"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for the structured pruning benchmark.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model choice, prune ratio, eval
+        settings, inference-speed measurement settings, seed, and output path.
+    """
     p = argparse.ArgumentParser(description="Structured MLP-width pruning benchmark: real inference speedup vs. perplexity cost.")
     p.add_argument("--model", type=str, default="./output/pretraining/clm", help="Model to prune. Default: this project's own from-scratch CLM checkpoint.")
     p.add_argument("--prune_ratio", type=float, default=0.5, help="Fraction of each MLP's intermediate channels to REMOVE (not just zero). Default: 0.5 (keep the top 50%% by L1 norm).")
@@ -72,11 +78,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def prune_mlp_width(model: nn.Module, prune_ratio: int) -> int:
-    """GPT2-style blocks: mlp.c_fc (hidden -> 4*hidden, Conv1D, weight
-    shape (in, out)) then mlp.c_proj (4*hidden -> hidden). Ranks c_fc's
-    OUTPUT channels (= c_proj's INPUT channels) by L1 norm, keeps the
-    top (1 - prune_ratio) fraction, and rebuilds both layers with
-    genuinely smaller weight tensors -- not masked, physically smaller.
+    """Structurally shrink every GPT2-style block's MLP intermediate width in place.
+
+    Ranks `mlp.c_fc`'s OUTPUT channels (= `mlp.c_proj`'s INPUT channels) by L1
+    norm, keeps the top `(1 - prune_ratio)` fraction, and rebuilds both layers
+    with genuinely smaller weight tensors -- not masked, physically smaller.
+
+    Args:
+        model (nn.Module): GPT2-style causal LM to prune in place (must expose
+            `model.transformer.h` blocks with `block.mlp.c_fc`/`c_proj` as `Conv1D`).
+        prune_ratio (float): Fraction of each MLP's intermediate channels to remove.
+
+    Returns:
+        int: Total number of intermediate channels removed across all blocks.
     """
     total_removed = 0
     for block in model.transformer.h:
@@ -104,13 +118,42 @@ def prune_mlp_width(model: nn.Module, prune_ratio: int) -> int:
 
 
 def tokenize_and_pack(dataset, tokenizer, block_size: int, desc: str):
+    """Tokenize a text dataset, append EOS per example, then concatenate and chunk
+    into fixed-size blocks for causal LM training/eval.
+
+    Args:
+        dataset: HF dataset with a `text` column.
+        tokenizer: Tokenizer used to encode `text`.
+        block_size (int): Fixed sequence length each packed example is chunked to.
+        desc (str): Short label used in progress-bar descriptions.
+
+    Returns:
+        Dataset: Packed dataset with `input_ids`, `attention_mask`, `labels`.
+    """
     def tokenize_fn(examples):
+        """Append EOS to each text and tokenize the batch.
+
+        Args:
+            examples (dict): Batch with a `text` column.
+
+        Returns:
+            dict: Tokenizer output (`input_ids`, `attention_mask`, ...).
+        """
         texts_with_eos = [t + tokenizer.eos_token for t in examples["text"]]
         return tokenizer(texts_with_eos)
 
     tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=dataset.column_names, desc=f"Tokenizing ({desc})")
 
     def group_texts(examples):
+        """Concatenate all tokenized examples in the batch and split into fixed blocks.
+
+        Args:
+            examples (dict): Batch of tokenizer output columns.
+
+        Returns:
+            dict: Same columns rechunked to `block_size`, plus `labels` (a copy
+            of `input_ids`); any remainder shorter than `block_size` is dropped.
+        """
         concatenated = {k: sum(examples[k], []) for k in examples.keys()}
         total_length = (len(concatenated["input_ids"]) // block_size) * block_size
         result = {k: [t[i : i + block_size] for i in range(0, total_length, block_size)] for k, t in concatenated.items()}
@@ -121,6 +164,19 @@ def tokenize_and_pack(dataset, tokenizer, block_size: int, desc: str):
 
 
 def evaluate_perplexity(model, eval_dataset, data_collator, batch_size, device):
+    """Compute average cross-entropy loss and perplexity over `eval_dataset`.
+
+    Args:
+        model: Causal LM to evaluate.
+        eval_dataset: Packed dataset of `input_ids`/`attention_mask`/`labels`.
+        data_collator: Collator used to batch examples (handles LM label shifting).
+        batch_size (int): Evaluation batch size.
+        device (str): Device to run evaluation on.
+
+    Returns:
+        tuple[float, float]: `(avg_loss, perplexity)`; perplexity is `inf` if
+        `avg_loss >= 20` to avoid an `OverflowError` from `math.exp`.
+    """
     model.eval()
     loader = torch.utils.data.DataLoader(eval_dataset, batch_size=batch_size, collate_fn=data_collator)
     total_loss, total_tokens = 0.0, 0
@@ -138,6 +194,21 @@ def evaluate_perplexity(model, eval_dataset, data_collator, batch_size, device):
 
 @torch.no_grad()
 def benchmark_inference(model, batch_size: int, seq_len: int, vocab_size: int, device: str, num_repeats: int):
+    """Time average per-call inference latency on random input of fixed shape.
+
+    Runs 3 warmup calls (untimed) before timing `num_repeats` calls.
+
+    Args:
+        model: Model to benchmark.
+        batch_size (int): Batch size for the random input.
+        seq_len (int): Sequence length for the random input.
+        vocab_size (int): Vocabulary size to sample random token ids from.
+        device (str): Device to run inference on.
+        num_repeats (int): Number of timed forward passes.
+
+    Returns:
+        float: Average seconds per forward pass.
+    """
     model.eval()
     input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
     for _ in range(3):
@@ -151,6 +222,10 @@ def benchmark_inference(model, batch_size: int, seq_len: int, vocab_size: int, d
 
 
 def main():
+    """Run the end-to-end pruning benchmark: evaluate a dense checkpoint, structurally
+    prune its MLP width, re-evaluate perplexity and inference latency, and record
+    results via `write_run_result` (or exit early with `--debug_first_batch`).
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Structured pruning (MLP width) benchmark")

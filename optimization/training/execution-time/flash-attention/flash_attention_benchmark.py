@@ -56,6 +56,12 @@ ATTN_IMPLEMENTATIONS = ["eager", "sdpa"]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for the FlashAttention (eager vs. SDPA) benchmark.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model choice, synthetic batch
+        shape, step/warmup counts, seed, and output path.
+    """
     p = argparse.ArgumentParser(description="Benchmark eager vs. SDPA (fused/flash-attention-family) attention on real forward+backward passes.")
     p.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B-Base", help="Model to benchmark (local path or HF Hub id). Default: this project's usual base-model default.")
     p.add_argument("--batch_size", type=int, default=2, help="Synthetic batch size. Default: 2.")
@@ -69,6 +75,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def build_synthetic_batch(vocab_size: int, batch_size: int, seq_len: int, device: str):
+    """Build a fixed-shape batch of random token ids for a compute/memory-only benchmark.
+
+    Args:
+        vocab_size (int): Upper bound (exclusive) for sampled token ids.
+        batch_size (int): Number of sequences in the batch.
+        seq_len (int): Length of each sequence.
+        device (str): Device to place the tensors on.
+
+    Returns:
+        dict: `{"input_ids", "attention_mask", "labels"}`, with `labels` equal to
+        `input_ids` (self-supervised LM loss) and a full (unpadded) attention mask.
+    """
     input_ids = torch.randint(low=0, high=vocab_size, size=(batch_size, seq_len), device=device)
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.clone()
@@ -76,6 +94,19 @@ def build_synthetic_batch(vocab_size: int, batch_size: int, seq_len: int, device
 
 
 def load_model_with_attn_impl(model_name: str, attn_implementation: str, device: str):
+    """Load a causal LM with a specific attention backend and wrap it in LoRA.
+
+    LoRA is applied purely as memory scaffolding (see module docstring) and does
+    not touch the attention computation path, so it doesn't confound the comparison.
+
+    Args:
+        model_name (str): Model to load (local path or HF Hub id).
+        attn_implementation (str): One of `"eager"` or `"sdpa"`.
+        device (str): Device to move the model to.
+
+    Returns:
+        The LoRA-wrapped model in train mode.
+    """
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -88,6 +119,18 @@ def load_model_with_attn_impl(model_name: str, attn_implementation: str, device:
 
 
 def run_benchmark(model, batch, num_steps: int, num_warmup: int, device: str):
+    """Run warmup then timed forward+backward steps on a fixed batch, tracking peak memory.
+
+    Args:
+        model: Model to benchmark, already in train mode.
+        batch (dict): Fixed batch reused for every step (from `build_synthetic_batch`).
+        num_steps (int): Number of timed steps.
+        num_warmup (int): Number of untimed warmup steps run first.
+        device (str): Device whose peak memory stats are tracked/reset.
+
+    Returns:
+        tuple[float, float, float]: `(avg_step_seconds, peak_memory_mb, final_loss)`.
+    """
     for _ in range(num_warmup):
         model.zero_grad(set_to_none=True)
         outputs = model(**batch)
@@ -109,6 +152,11 @@ def run_benchmark(model, batch, num_steps: int, num_warmup: int, device: str):
 
 
 def main():
+    """Run the end-to-end FlashAttention benchmark: build a synthetic batch, run
+    forward+backward under both `eager` and `sdpa` attention, compare step time and
+    peak memory, and record results via `write_run_result` (or exit early with
+    `--debug_first_batch`).
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "FlashAttention (eager vs. SDPA) benchmark")

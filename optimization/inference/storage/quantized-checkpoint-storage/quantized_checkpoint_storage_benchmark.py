@@ -41,6 +41,12 @@ CONFIGS = ["bf16", "8bit", "4bit"]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for the quantized checkpoint storage benchmark.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model checkpoint choice, output
+        directory, seed, and debug mode.
+    """
     p = argparse.ArgumentParser(description="Measure real on-disk size of bf16 vs. bnb 8-bit vs. bnb 4-bit saved checkpoints.")
     p.add_argument("--model", type=str, default="./output/pretraining/clm", help="Model checkpoint to re-save at each quantization level. Default: this project's own from-scratch CLM checkpoint.")
     p.add_argument("--output_dir", type=str, default="./output/optimization/quantized_checkpoint_storage_benchmark", help="Where to write the resaved checkpoints and run_result.json.")
@@ -50,6 +56,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def dir_size_bytes(path: str) -> int:
+    """Recursively sum the size of every file under `path`.
+
+    Args:
+        path (str): Directory to measure.
+
+    Returns:
+        int: Total size in bytes.
+    """
     total = 0
     for root, _, files in os.walk(path):
         for f in files:
@@ -58,6 +72,17 @@ def dir_size_bytes(path: str) -> int:
 
 
 def save_and_time(model_name: str, config_name: str, output_dir: str):
+    """Load a checkpoint at the given quantization level, save it, and measure
+    both save time and resulting on-disk size.
+
+    Args:
+        model_name (str): Source checkpoint (local dir or HF Hub id) to load.
+        config_name (str): One of `"bf16"`, `"8bit"`, `"4bit"` — quantization level.
+        output_dir (str): Directory to save the re-saved checkpoint to.
+
+    Returns:
+        tuple[float, int]: `(save_seconds, size_bytes)` for the saved checkpoint.
+    """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     os.makedirs(output_dir, exist_ok=True)
@@ -80,6 +105,15 @@ def save_and_time(model_name: str, config_name: str, output_dir: str):
 
 
 def load_and_time(output_dir: str, config_name: str):
+    """Load a previously-saved checkpoint at the given quantization level and time it.
+
+    Args:
+        output_dir (str): Directory containing the saved checkpoint to load.
+        config_name (str): One of `"bf16"`, `"8bit"`, `"4bit"` — quantization level.
+
+    Returns:
+        float: Seconds spent loading the checkpoint.
+    """
     from transformers import AutoModelForCausalLM
 
     start = time.time()
@@ -95,6 +129,10 @@ def load_and_time(output_dir: str, config_name: str):
 
 
 def main():
+    """Run the end-to-end storage benchmark: save the same checkpoint at bf16,
+    8-bit, and 4-bit, measure real on-disk sizes and save/load times, and record
+    results via `write_run_result` (or exit early with `--debug_first_batch`).
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Quantized checkpoint storage benchmark")

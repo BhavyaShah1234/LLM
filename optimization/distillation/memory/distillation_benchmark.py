@@ -56,6 +56,12 @@ CLASS_NAMES = ["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for the distillation benchmark.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering teacher/student config,
+        distillation hyperparameters, training settings, and I/O paths.
+    """
     p = argparse.ArgumentParser(description="Distill a small from-scratch ViT student from this project's trained ViT-base teacher.")
 
     p.add_argument("--teacher_dir", type=str, default="./output/supervised-finetuning/image/image_classification", help="This project's own trained image classification teacher. Default: image_classification.py's output.")
@@ -85,6 +91,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def load_and_prepare_data(args, processor):
+    """Load CIFAR-10 train/test splits and wrap them with an image-processor transform.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `max_samples`, `sample_selection`,
+            `max_eval_samples`, and `seed`.
+        processor: HF image processor used to convert PIL images to pixel tensors.
+
+    Returns:
+        tuple: `(train_dataset, eval_dataset)`, HF datasets with an on-the-fly transform
+        producing `pixel_values` and `labels`.
+    """
     print_banner("LOADING DATASET")
     train_raw = load_dataset(DATASET_NAME, split="train")
     eval_raw = load_dataset(DATASET_NAME, split="test")
@@ -93,6 +110,14 @@ def load_and_prepare_data(args, processor):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def transform(examples):
+        """Convert a batch of PIL images to pixel tensors via `processor`.
+
+        Args:
+            examples (dict): Batch with `img` (list of PIL images) and `label`.
+
+        Returns:
+            dict: `{"pixel_values", "labels"}` ready for the model.
+        """
         pixel_values = processor([img.convert("RGB") for img in examples["img"]], return_tensors="pt")["pixel_values"]
         return {"pixel_values": pixel_values, "labels": examples["label"]}
 
@@ -104,12 +129,31 @@ def load_and_prepare_data(args, processor):
 
 
 def collate_fn(batch):
+    """Stack a list of transformed examples into a single batch tensor dict.
+
+    Args:
+        batch (list[dict]): Examples each with `pixel_values` and `labels`.
+
+    Returns:
+        dict: `{"pixel_values", "labels"}` batched tensors.
+    """
     pixel_values = torch.stack([item["pixel_values"] for item in batch])
     labels = torch.tensor([item["labels"] for item in batch])
     return {"pixel_values": pixel_values, "labels": labels}
 
 
 def build_student(hidden_size: int, num_layers: int, num_heads: int, num_classes: int) -> ViTForImageClassification:
+    """Construct a randomly-initialized, scaled-down ViT to serve as the distillation student.
+
+    Args:
+        hidden_size (int): Transformer hidden size.
+        num_layers (int): Number of transformer layers.
+        num_heads (int): Number of attention heads.
+        num_classes (int): Number of output classes.
+
+    Returns:
+        ViTForImageClassification: A from-scratch (non-pretrained) student model.
+    """
     config = ViTConfig(
         hidden_size=hidden_size,
         num_hidden_layers=num_layers,
@@ -123,6 +167,18 @@ def build_student(hidden_size: int, num_layers: int, num_heads: int, num_classes
 
 
 def distillation_loss(student_logits, teacher_logits, labels, temperature: float, alpha: float):
+    """Compute the combined KL (soft-target) + cross-entropy (hard-label) distillation loss.
+
+    Args:
+        student_logits (torch.Tensor): Student model output logits.
+        teacher_logits (torch.Tensor): Teacher model output logits.
+        labels (torch.Tensor): Ground-truth class labels.
+        temperature (float): Softmax temperature used to soften both distributions.
+        alpha (float): Weight on the KD loss vs. the hard-label CE loss.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]: `(total_loss, kd_loss, ce_loss)`.
+    """
     soft_targets = F.log_softmax(student_logits / temperature, dim=-1)
     soft_teacher = F.softmax(teacher_logits / temperature, dim=-1)
     kd_loss = F.kl_div(soft_targets, soft_teacher, reduction="batchmean") * (temperature**2)
@@ -132,6 +188,16 @@ def distillation_loss(student_logits, teacher_logits, labels, temperature: float
 
 @torch.no_grad()
 def evaluate(student, loader, device):
+    """Run inference over `loader` and compute accuracy and macro F1.
+
+    Args:
+        student: Model to evaluate (also used for the teacher).
+        loader (torch.utils.data.DataLoader): Batches of `pixel_values`/`labels`.
+        device (str): Device to run inference on.
+
+    Returns:
+        dict: `{"accuracy", "f1_macro"}` evaluation metrics.
+    """
     student.eval()
     all_preds, all_labels = [], []
     for batch in loader:
@@ -145,6 +211,18 @@ def evaluate(student, loader, device):
 
 @torch.no_grad()
 def benchmark_inference(model, pixel_values, num_repeats: int = 20):
+    """Time average per-call inference latency for a single fixed batch.
+
+    Runs 3 warmup calls (untimed) before timing `num_repeats` calls.
+
+    Args:
+        model: Model to benchmark.
+        pixel_values (torch.Tensor): Fixed input batch reused for every call.
+        num_repeats (int): Number of timed forward passes. Defaults to 20.
+
+    Returns:
+        float: Average seconds per forward pass.
+    """
     model.eval()
     device = next(model.parameters()).device
     pixel_values = pixel_values.to(device)
@@ -159,6 +237,14 @@ def benchmark_inference(model, pixel_values, num_repeats: int = 20):
 
 
 def dir_size_bytes(path: str) -> int:
+    """Recursively sum the size of every file under `path`.
+
+    Args:
+        path (str): Directory to measure.
+
+    Returns:
+        int: Total size in bytes.
+    """
     total = 0
     for root, _, files in os.walk(path):
         for f in files:
@@ -167,6 +253,11 @@ def dir_size_bytes(path: str) -> int:
 
 
 def main():
+    """Run the end-to-end distillation benchmark: load the trained teacher and a
+    from-scratch student, distill, then report accuracy, inference latency, and
+    checkpoint-size deltas via `write_run_result` (or exit early with
+    `--debug_first_batch`).
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Knowledge distillation (from-scratch ViT-Tiny student, this project's trained ViT-base teacher)")

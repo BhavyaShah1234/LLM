@@ -50,6 +50,12 @@ ARCHITECTURE = "decoder-only"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for the PTQ benchmark.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering checkpoint choice, quantization
+        bit-width, eval settings, seed, and output path.
+    """
     p = argparse.ArgumentParser(description="Post-Training Quantization benchmark: quantize a finished checkpoint with no further training.")
     p.add_argument("--model", type=str, default="./output/pretraining/clm", help="Pretrained checkpoint to quantize (local dir or HF Hub id). Default: this project's own from-scratch CLM checkpoint -- same default as qat.py, for a like-for-like comparison.")
     p.add_argument("--num_bits", type=int, default=8, choices=[4, 8], help="Simulated quantization bit-width for weights. Default: 8.")
@@ -71,6 +77,16 @@ class FakeQuantSTE(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, weight, num_bits):
+        """Round-trip `weight` through a symmetric per-tensor fake quantizer.
+
+        Args:
+            ctx: Autograd context (unused; kept for the `Function` interface).
+            weight (torch.Tensor): Weight tensor to fake-quantize.
+            num_bits (int): Quantization bit-width.
+
+        Returns:
+            torch.Tensor: Dequantized weight with the same shape/dtype as `weight`.
+        """
         qmax = 2 ** (num_bits - 1) - 1
         qmin = -(2 ** (num_bits - 1))
         scale = weight.detach().abs().max().clamp(min=1e-8) / qmax
@@ -79,23 +95,72 @@ class FakeQuantSTE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Pass the gradient straight through (straight-through estimator).
+
+        Args:
+            ctx: Autograd context (unused).
+            grad_output (torch.Tensor): Gradient w.r.t. the quantized output.
+
+        Returns:
+            tuple[torch.Tensor, None]: Gradient w.r.t. `weight` (unchanged) and
+            `None` for the non-differentiable `num_bits` argument.
+        """
         return grad_output, None
 
 
 class FakeQuantLinear(nn.Module):
+    """Drop-in replacement for `nn.Linear` that fake-quantizes its weight on every
+    forward pass, wrapping an already-trained `nn.Linear`'s parameters in place.
+
+    Attributes:
+        weight (torch.Tensor): Shared reference to the original module's weight.
+        bias (torch.Tensor): Shared reference to the original module's bias.
+        num_bits (int): Quantization bit-width applied on each forward pass.
+    """
+
     def __init__(self, orig: nn.Linear, num_bits: int):
+        """Wrap an existing `nn.Linear`, reusing its weight/bias in place.
+
+        Args:
+            orig (nn.Linear): Module to wrap; its parameters are reused, not copied.
+            num_bits (int): Quantization bit-width applied on each forward pass.
+        """
         super().__init__()
         self.weight = orig.weight
         self.bias = orig.bias
         self.num_bits = num_bits
 
     def forward(self, x):
+        """Fake-quantize the weight, then apply a standard linear transform.
+
+        Args:
+            x (torch.Tensor): Input activations.
+
+        Returns:
+            torch.Tensor: `x @ fake_quantized_weight.T + bias`.
+        """
         w = FakeQuantSTE.apply(self.weight, self.num_bits)
         return F.linear(x, w, self.bias)
 
 
 class FakeQuantConv1D(nn.Module):
+    """Drop-in replacement for `transformers.pytorch_utils.Conv1D` (GPT-2's
+    projection layer) that fake-quantizes its weight on every forward pass.
+
+    Attributes:
+        weight (torch.Tensor): Shared reference to the original module's weight.
+        bias (torch.Tensor): Shared reference to the original module's bias.
+        nf (int): Output feature size, as used by `Conv1D`.
+        num_bits (int): Quantization bit-width applied on each forward pass.
+    """
+
     def __init__(self, orig: Conv1D, num_bits: int):
+        """Wrap an existing `Conv1D`, reusing its weight/bias in place.
+
+        Args:
+            orig (Conv1D): Module to wrap; its parameters are reused, not copied.
+            num_bits (int): Quantization bit-width applied on each forward pass.
+        """
         super().__init__()
         self.weight = orig.weight
         self.bias = orig.bias
@@ -103,6 +168,15 @@ class FakeQuantConv1D(nn.Module):
         self.num_bits = num_bits
 
     def forward(self, x):
+        """Fake-quantize the weight, then apply `Conv1D`'s addmm-based transform.
+
+        Args:
+            x (torch.Tensor): Input activations.
+
+        Returns:
+            torch.Tensor: Output reshaped back to `x`'s leading dimensions with
+            `nf` as the last dimension.
+        """
         w = FakeQuantSTE.apply(self.weight, self.num_bits)
         size_out = x.size()[:-1] + (self.nf,)
         x = torch.addmm(self.bias, x.view(-1, x.size(-1)), w)
@@ -110,6 +184,16 @@ class FakeQuantConv1D(nn.Module):
 
 
 def apply_fake_quant(model: nn.Module, num_bits: int) -> int:
+    """Replace every `nn.Linear`/`Conv1D` submodule of `model` in place with a
+    fake-quantized equivalent.
+
+    Args:
+        model (nn.Module): Model to modify in place.
+        num_bits (int): Quantization bit-width to apply.
+
+    Returns:
+        int: Number of modules replaced.
+    """
     replaced = 0
     modules = list(model.modules())
     for module in modules:
@@ -124,13 +208,42 @@ def apply_fake_quant(model: nn.Module, num_bits: int) -> int:
 
 
 def tokenize_and_pack(dataset, tokenizer, block_size: int, desc: str):
+    """Tokenize a text dataset, append EOS per example, then concatenate and chunk
+    into fixed-size blocks for causal LM training/eval.
+
+    Args:
+        dataset: HF dataset with a `text` column.
+        tokenizer: Tokenizer used to encode `text`.
+        block_size (int): Fixed sequence length each packed example is chunked to.
+        desc (str): Short label used in progress-bar descriptions.
+
+    Returns:
+        Dataset: Packed dataset with `input_ids`, `attention_mask`, `labels`.
+    """
     def tokenize_fn(examples):
+        """Append EOS to each text and tokenize the batch.
+
+        Args:
+            examples (dict): Batch with a `text` column.
+
+        Returns:
+            dict: Tokenizer output (`input_ids`, `attention_mask`, ...).
+        """
         texts_with_eos = [t + tokenizer.eos_token for t in examples["text"]]
         return tokenizer(texts_with_eos)
 
     tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=dataset.column_names, desc=f"Tokenizing ({desc})")
 
     def group_texts(examples):
+        """Concatenate all tokenized examples in the batch and split into fixed blocks.
+
+        Args:
+            examples (dict): Batch of tokenizer output columns.
+
+        Returns:
+            dict: Same columns rechunked to `block_size`, plus `labels` (a copy
+            of `input_ids`); any remainder shorter than `block_size` is dropped.
+        """
         concatenated = {k: sum(examples[k], []) for k in examples.keys()}
         total_length = (len(concatenated["input_ids"]) // block_size) * block_size
         result = {k: [t[i : i + block_size] for i in range(0, total_length, block_size)] for k, t in concatenated.items()}
@@ -141,6 +254,19 @@ def tokenize_and_pack(dataset, tokenizer, block_size: int, desc: str):
 
 
 def evaluate_perplexity(model, eval_dataset, data_collator, batch_size, device):
+    """Compute average cross-entropy loss and perplexity over `eval_dataset`.
+
+    Args:
+        model: Causal LM to evaluate.
+        eval_dataset: Packed dataset of `input_ids`/`attention_mask`/`labels`.
+        data_collator: Collator used to batch examples (handles LM label shifting).
+        batch_size (int): Evaluation batch size.
+        device (str): Device to run evaluation on.
+
+    Returns:
+        tuple[float, float]: `(avg_loss, perplexity)`; perplexity is `inf` if
+        `avg_loss >= 20` to avoid an `OverflowError` from `math.exp`.
+    """
     model.eval()
     loader = torch.utils.data.DataLoader(eval_dataset, batch_size=batch_size, collate_fn=data_collator)
     total_loss, total_tokens = 0.0, 0
@@ -157,6 +283,11 @@ def evaluate_perplexity(model, eval_dataset, data_collator, batch_size, device):
 
 
 def main():
+    """Run the end-to-end PTQ benchmark: evaluate a checkpoint at full precision,
+    fake-quantize its weights with zero further training, re-evaluate, and record
+    the perplexity delta via `write_run_result` (or exit early with
+    `--debug_first_batch`).
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Post-Training Quantization (PTQ) benchmark")

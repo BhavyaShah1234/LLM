@@ -38,6 +38,12 @@ INSTRUCTION = "Answer the following medical multiple choice question by selectin
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for the speculative decoding benchmark.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering target/draft model choice, prompt
+        count, generation length, seed, and output path.
+    """
     p = argparse.ArgumentParser(description="Benchmark plain vs. speculative-decoding generation throughput.")
     p.add_argument("--target_model", type=str, default="Qwen/Qwen3-1.7B-Base", help="Target model whose output distribution is preserved exactly. Default: this project's usual base-model default.")
     p.add_argument("--draft_model", type=str, default="Qwen/Qwen3-0.6B-Base", help="Smaller draft/assistant model proposing tokens for the target to verify. Default: same family/tokenizer as --target_model, ~3x fewer params.")
@@ -50,14 +56,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def format_question(row) -> str:
+    """Render a MedMCQA row's question and four options as plain text.
+
+    Args:
+        row: Dataset row with `Question`, `Option_A`-`Option_D`.
+
+    Returns:
+        str: Question followed by lettered options.
+    """
     return f"{row['Question']}\n\nA. {row['Option_A']}\nB. {row['Option_B']}\nC. {row['Option_C']}\nD. {row['Option_D']}"
 
 
 def build_prompt(row) -> str:
+    """Wrap a formatted MedMCQA question in the instruction/input/response template.
+
+    Args:
+        row: Dataset row with `Question`, `Option_A`-`Option_D`.
+
+    Returns:
+        str: Full prompt text ending at `### Response:\n`, ready for generation.
+    """
     return f"### Instruction:\n{INSTRUCTION}\n\n### Input:\n{format_question(row)}\n\n### Response:\n"
 
 
 def load_prompts(num_prompts: int, seed: int):
+    """Load a fixed slice of the MedMCQA dev split and render it into prompts.
+
+    Args:
+        num_prompts (int): Number of prompts to load.
+        seed (int): Seed passed through to `select_samples`.
+
+    Returns:
+        list[str]: Rendered prompts, one per selected row.
+    """
     from datasets import load_dataset
 
     eval_raw = load_dataset(DATASET_NAME, DATASET_CONFIG, split="dev")
@@ -66,6 +97,19 @@ def load_prompts(num_prompts: int, seed: int):
 
 
 def generate_and_time(model, tokenizer, prompts, max_new_tokens: int, assistant_model=None):
+    """Greedy-generate a completion for each prompt and time the total wall-clock cost.
+
+    Args:
+        model: Target causal LM to generate from.
+        tokenizer: Tokenizer shared by the target and (if given) draft model.
+        prompts (list[str]): Prompts to generate on, one request at a time.
+        max_new_tokens (int): Max tokens to generate per prompt.
+        assistant_model: Optional smaller draft model passed to `generate()`'s
+            `assistant_model` for speculative decoding; `None` for plain generation.
+
+    Returns:
+        tuple[float, int]: `(elapsed_seconds, total_generated_tokens)`.
+    """
     device = model.device
     total_tokens = 0
     start = time.time()
@@ -82,6 +126,10 @@ def generate_and_time(model, tokenizer, prompts, max_new_tokens: int, assistant_
 
 
 def main():
+    """Run the end-to-end speculative decoding benchmark: generate the same prompts
+    plain vs. with a draft model assisting, compare throughput, and record results
+    via `write_run_result` (or exit early with `--debug_first_batch`).
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Speculative decoding benchmark")
