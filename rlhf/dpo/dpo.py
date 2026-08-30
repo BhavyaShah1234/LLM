@@ -55,6 +55,13 @@ ARCHITECTURE = "decoder-only"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for this script's model/LoRA/DPO/training options.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model/quantization, LoRA,
+        DPO (`--beta`, `--max_length`), training hyperparameters, data
+        selection, output/checkpointing, and `--seed`/`--debug_first_batch`.
+    """
     p = argparse.ArgumentParser(description="Align a decoder-only model with DPO.")
 
     p.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B", help="SFT'd/instruction-tuned checkpoint to align (local path or HF Hub id) -- NOT a raw base model, see module docstring. Default: Qwen/Qwen3-1.7B (vendor instruct, fp16 ~4.1GB).")
@@ -93,6 +100,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset() -> None:
+    """Stream-peek one row of the dataset and assert the expected preference fields are present."""
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -106,6 +114,16 @@ def verify_dataset() -> None:
 
 
 def load_and_prepare_data(args):
+    """Load the train/test splits and subsample them per the CLI args.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `max_samples`,
+            `sample_selection`, `max_eval_samples`, and `seed`.
+
+    Returns:
+        tuple: `(train_dataset, eval_dataset)`, each a subsampled `Dataset`
+        of chosen/rejected preference pairs.
+    """
     print_banner("LOADING DATASET")
     train_dataset = load_dataset(DATASET_NAME, split="train")
     eval_dataset = load_dataset(DATASET_NAME, split="test")
@@ -120,6 +138,12 @@ def load_and_prepare_data(args):
 
 
 def print_debug_examples(dataset, num_examples: int = 2) -> None:
+    """Print a few formatted prompt/chosen/rejected triples for a sanity check.
+
+    Args:
+        dataset: A chosen/rejected preference dataset to sample from.
+        num_examples (int): Number of rows to print. Defaults to 2.
+    """
     print_banner("FORMATTED PREFERENCE PAIRS")
     for i in range(min(num_examples, len(dataset))):
         example = dataset[i]
@@ -134,6 +158,7 @@ def print_debug_examples(dataset, num_examples: int = 2) -> None:
 
 
 def main():
+    """Run the DPO alignment pipeline: load data, build the trainer, train, evaluate, save, and record results."""
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "DPO alignment -- decoder-only")

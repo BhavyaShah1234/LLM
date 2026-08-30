@@ -17,13 +17,33 @@ def select_samples(
     seed: int,
     is_streaming: bool = False,
 ):
-    """max_samples == -1 means "use everything" (dataset returned unchanged).
+    """Truncate/select a subset of a dataset per the shared --max_samples convention.
+
+    max_samples == -1 means "use everything" (dataset returned unchanged).
     sample_selection: 'random' | 'first' | 'last'. A max_samples larger than
     the dataset is clamped to the dataset's actual size rather than raising
     an IndexError -- found necessary in practice: some HF dataset mirrors
     have far fewer rows than expected for a given split (e.g. a "validation"
     split with 60 rows), and scripts' --max_eval_samples defaults are sized
     for typical splits, not every possible dataset's actual split sizes.
+
+    Args:
+        dataset: A `datasets.Dataset` (map-style) or `IterableDataset`
+            (streaming) to select from.
+        max_samples (int): Number of samples to keep, or -1 to keep all.
+        sample_selection (str): Which samples to keep: "random", "first", or
+            "last".
+        seed (int): RNG seed used when `sample_selection == "random"`.
+        is_streaming (bool): Whether `dataset` is a streaming `IterableDataset`
+            (changes which selection ops are valid/available).
+
+    Returns:
+        The selected dataset (same type as the input `dataset`).
+
+    Raises:
+        ValueError: If `sample_selection` is "last" on a streaming dataset
+            (not supported), or if `sample_selection` is not one of
+            "random"/"first"/"last".
     """
     if max_samples == -1:
         return dataset

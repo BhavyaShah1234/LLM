@@ -12,6 +12,11 @@ import warnings
 warnings.filterwarnings("ignore")
 
 def parse_args():
+    """Parse CLI arguments controlling model choice, quantization/LoRA, and training hyperparameters.
+
+    Returns:
+        argparse.Namespace: parsed arguments consumed by `load_data`, `setup`, and `main`.
+    """
     p=argparse.ArgumentParser()
     p.add_argument("--model",type=str,required=True,choices=["Qwen/Qwen3-4B-Base","Qwen/Qwen3-4B","Qwen/Qwen3-4B-Thinking-2507","Qwen/Qwen3-4B-Instruct-2507"])
     p.add_argument("--quantization",type=str,default="4bit",choices=["no","4bit","8bit"])
@@ -42,11 +47,36 @@ def parse_args():
     return p.parse_args()
 
 class ChatDS(Dataset):
+    """Torch dataset that tokenizes prompt/response chat pairs and masks the prompt tokens out of the loss.
+
+    Attributes:
+        data (list): list of `{"prompt": str, "response": str}` examples.
+        tok: tokenizer used to encode prompt and full (prompt + response) text.
+        ml (int): max token length the full sequence is truncated to.
+    """
     def __init__(self,d,tok,ml):
+        """Store the examples, tokenizer, and max length used at `__getitem__` time.
+
+        Args:
+            d (list): list of `{"prompt": str, "response": str}` examples.
+            tok: tokenizer with a callable `__call__` interface.
+            ml (int): max sequence length passed to the tokenizer for the full text.
+        """
         self.data,self.tok,self.ml=d,tok,ml
     def __len__(self):
+        """Return the number of examples in the dataset."""
         return len(self.data)
     def __getitem__(self,i):
+        """Tokenize example `i` and mask prompt tokens in the labels with -100.
+
+        Args:
+            i (int): index of the example to fetch.
+
+        Returns:
+            dict: `input_ids`, `attention_mask`, and `labels` tensors for the example,
+            with label positions covering the prompt set to -100 so they're excluded
+            from the loss.
+        """
         it=self.data[i]
         pr,rsp=it['prompt'],it['response']
         fu=pr+rsp
@@ -58,6 +88,15 @@ class ChatDS(Dataset):
         return {"input_ids":torch.tensor(ii),"attention_mask":torch.tensor(am),"labels":torch.tensor(lb)}
 
 def load_data(a):
+    """Load and format the MathChatSync-reasoning dataset into prompt/response pairs, splitting off a test set.
+
+    Args:
+        a (argparse.Namespace): parsed CLI args; uses `max_samples` to optionally cap the
+            train/test set sizes.
+
+    Returns:
+        tuple[list, list]: `(train, test)` lists of `{"prompt": str, "response": str}` dicts.
+    """
     print("\\nLoading: devrev-research/MathChatSync-reasoning")
     ds=load_dataset("devrev-research/MathChatSync-reasoning")
     def fmt(e):
@@ -74,6 +113,15 @@ def load_data(a):
     return tr,te
 
 def setup(a):
+    """Load the tokenizer and base model, applying quantization, gradient checkpointing, and LoRA per args.
+
+    Args:
+        a (argparse.Namespace): parsed CLI args controlling model name, quantization,
+            mixed precision, gradient checkpointing, and LoRA settings.
+
+    Returns:
+        tuple: `(model, tokenizer)` ready for training.
+    """
     tok=AutoTokenizer.from_pretrained(a.model,trust_remote_code=True,use_fast=False)
     if tok.pad_token is None:
         tok.pad_token=tok.eos_token
@@ -92,6 +140,7 @@ def setup(a):
     return m,tok
 
 def main():
+    """Parse args, load data and model, and run the standard chat SFT training loop end to end."""
     a=parse_args()
     random.seed(a.seed);np.random.seed(a.seed);torch.manual_seed(a.seed)
     print(f"\\n{'='*80}\\nChat Tuning Standard\\n{'='*80}")

@@ -39,6 +39,13 @@ MAX_SPANS = 10
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this training script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model/quantization, LoRA,
+            training hyperparameters, data sampling, output/checkpointing,
+            and seeding/debug flags.
+    """
     p = argparse.ArgumentParser(description="SFT a decoder-only model for context-relevance span extraction (with CoT).")
 
     p.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B-Base", help="Base checkpoint. Default: Qwen/Qwen3-1.7B-Base.")
@@ -78,6 +85,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset() -> None:
+    """Peek the dataset via streaming and assert the expected fields are present.
+
+    Not called by default in ``main`` (see the comment there) since it would
+    otherwise trigger a second load of the same dataset.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -89,6 +101,17 @@ def verify_dataset() -> None:
 
 
 def extract_spans(row):
+    """Extract up to ``MAX_SPANS`` relevant/not-relevant text spans from a raw dataset row.
+
+    Args:
+        row (dict): Raw dataset row with "texts", "context_spans" (list of
+            (start, end) offsets per passage), and "context_spans_relevance"
+            (parallel list of 0/1 relevance labels).
+
+    Returns:
+        list[dict]: Each item is ``{"entity": str, "label": "relevant" | "not_relevant"}``,
+            capped at ``MAX_SPANS`` entries.
+    """
     texts = row["texts"]
     context_spans = row["context_spans"]
     relevance = row["context_spans_relevance"]
@@ -103,6 +126,15 @@ def extract_spans(row):
 
 
 def extract_reasoning(row) -> str:
+    """Extract and clean the dataset's own chain-of-thought reasoning field.
+
+    Args:
+        row (dict): Raw dataset row with a "think_process" field (str or list of str).
+
+    Returns:
+        str: Cleaned reasoning text truncated to 800 characters, or a generic
+            fallback sentence if empty.
+    """
     think = row.get("think_process", "")
     if isinstance(think, list):
         think = " ".join(str(t) for t in think)
@@ -111,15 +143,50 @@ def extract_reasoning(row) -> str:
 
 
 class SpanExtractionCoTDataset(Dataset):
+    """Tokenized span-extraction dataset with chain-of-thought supervision.
+
+    Formats each row as ``### Instruction: ... ### Input: ... ### Response:
+    <think>{think_process}</think>{spans_json}`` and masks the prompt out of
+    the loss, so the loss covers both the reasoning and the span-JSON tokens.
+
+    Attributes:
+        rows (list): Raw dataset rows with "texts", "context_spans",
+            "context_spans_relevance", and "think_process" fields.
+        tokenizer: Tokenizer used to encode prompt and full text.
+        max_length (int): Max sequence length used when tokenizing the full example.
+    """
+
     def __init__(self, rows, tokenizer, max_length: int):
+        """Initialize the dataset.
+
+        Args:
+            rows (list): Raw dataset rows with "texts", "context_spans",
+                "context_spans_relevance", and "think_process" fields.
+            tokenizer: Tokenizer used to encode prompt and full text.
+            max_length (int): Max sequence length used when tokenizing the full example.
+        """
         self.rows = rows
         self.tokenizer = tokenizer
         self.max_length = max_length
 
     def __len__(self):
+        """Return the number of examples in the dataset.
+
+        Returns:
+            int: Number of rows.
+        """
         return len(self.rows)
 
     def __getitem__(self, idx):
+        """Build a tokenized, loss-masked training example with CoT + span-JSON supervision.
+
+        Args:
+            idx (int): Index of the row to fetch.
+
+        Returns:
+            dict: ``input_ids``, ``attention_mask``, and ``labels`` (prompt
+                tokens masked with -100; reasoning and span-JSON tokens kept).
+        """
         row = self.rows[idx]
         text = " ".join(str(t) for t in row["texts"])[:2000]
         reasoning = extract_reasoning(row)
@@ -141,6 +208,18 @@ class SpanExtractionCoTDataset(Dataset):
 
 
 def load_and_prepare_data(args, tokenizer):
+    """Load the full dataset, carve off a 10% eval split, and apply sample selection.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses ``max_samples``,
+            ``sample_selection``, ``max_eval_samples``, ``max_length``, and ``seed``.
+        tokenizer: Tokenizer passed through to the constructed datasets.
+
+    Returns:
+        tuple: ``(train_dataset, eval_dataset, eval_rows)`` where the first two
+            are :class:`SpanExtractionCoTDataset` instances and ``eval_rows`` is
+            the raw (untokenized) list of eval rows for later generation-based evaluation.
+    """
     print_banner("LOADING DATASET")
     all_raw = load_dataset(DATASET_NAME, split="train")
 
@@ -163,6 +242,18 @@ def load_and_prepare_data(args, tokenizer):
 
 
 def decode_example(example, index, tokenizer):
+    """Render a tokenized example back to text for ``--debug_first_batch`` inspection.
+
+    Args:
+        example (dict): Tokenized example with ``input_ids`` and ``labels``.
+        index (int): Position of this example in the batch being printed (unused
+            in the body but kept for a uniform ``decode_fn`` signature).
+        tokenizer: Tokenizer used to decode ``input_ids`` and the unmasked labels.
+
+    Returns:
+        str: Human-readable dump of the full formatted text and the
+            reasoning+span-JSON portion the loss is computed on.
+    """
     input_ids = example["input_ids"]
     labels = example["labels"]
     full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
@@ -172,6 +263,23 @@ def decode_example(example, index, tokenizer):
 
 
 def evaluate_model(model, tokenizer, eval_rows, args):
+    """Generate CoT + span-JSON completions and score span-level precision/recall/F1.
+
+    Also tracks how often the model emits a ``<think>...</think>`` block and
+    how long that reasoning is.
+
+    Args:
+        model: Trained causal LM used for generation.
+        tokenizer: Tokenizer used to build prompts and decode generations.
+        eval_rows (list): Raw eval rows with "texts", "context_spans", and
+            "context_spans_relevance" fields.
+        args (argparse.Namespace): Parsed CLI args; uses ``max_length``.
+
+    Returns:
+        dict: F1/precision/recall over predicted vs. true (entity, label)
+            span sets, whether CoT was enabled, CoT usage rate, and average
+            CoT length in words.
+    """
     print_banner("EVALUATION")
     model.eval()
     num_correct = num_pred = num_true = 0
@@ -226,6 +334,7 @@ def evaluate_model(model, tokenizer, eval_rows, args):
 
 
 def main():
+    """Run the end-to-end span-extraction-with-CoT pipeline: load, train, evaluate, save, record."""
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Context-relevance span extraction SFT -- decoder-only, with CoT")

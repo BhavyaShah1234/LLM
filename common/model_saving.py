@@ -28,6 +28,14 @@ _VALID_STRATEGIES = {"full", "adapter_only", "merged", "adapter_and_merged", "ba
 
 
 def _dir_size_human(path: str) -> str:
+    """Get a directory's on-disk size as a human-readable string (via `du -sh`).
+
+    Args:
+        path (str): Directory to measure.
+
+    Returns:
+        str: Human-readable size (e.g. "1.2G"), or "unknown" if `du` fails.
+    """
     try:
         out = subprocess.run(["du", "-sh", path], capture_output=True, text=True, check=True)
         return out.stdout.split()[0]
@@ -43,6 +51,26 @@ def save_model(
     base_model_name: Optional[str] = None,
     is_lora: bool = False,
 ) -> None:
+    """Save a trained model according to one of the module's save strategies.
+
+    See the module docstring for what each strategy value does.
+
+    Args:
+        model: The trained model (or PeftModel, if `is_lora`) to save.
+        tokenizer: Tokenizer to save alongside the model.
+        output_dir (str): Directory to write the saved model(s) into.
+        strategy (str): One of "full", "adapter_only", "merged",
+            "adapter_and_merged", or "base_reference".
+        base_model_name (Optional[str]): Base checkpoint id/path, required
+            for the "base_reference" strategy and any LoRA strategy that
+            writes a base-reference pointer file.
+        is_lora (bool): Whether `model` is a LoRA-adapted PeftModel.
+
+    Raises:
+        ValueError: If `strategy` is not a recognized strategy, if
+            `strategy='full'` is used with `is_lora=True`, or if a
+            LoRA-only strategy is used with `is_lora=False`.
+    """
     if strategy not in _VALID_STRATEGIES:
         raise ValueError(f"Unknown save strategy {strategy!r}; expected one of {sorted(_VALID_STRATEGIES)}")
 
@@ -70,6 +98,13 @@ def save_model(
 
 
 def _save_full(model, tokenizer, output_dir: str) -> None:
+    """Save the complete model and tokenizer as-is.
+
+    Args:
+        model: Model to save.
+        tokenizer: Tokenizer to save.
+        output_dir (str): Directory to save into (created if missing).
+    """
     os.makedirs(output_dir, exist_ok=True)
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
@@ -77,6 +112,13 @@ def _save_full(model, tokenizer, output_dir: str) -> None:
 
 
 def _save_adapter_only(model, tokenizer, output_dir: str) -> None:
+    """Save just the LoRA adapter weights (not the base model).
+
+    Args:
+        model: PeftModel whose adapter weights should be saved.
+        tokenizer: Tokenizer to save.
+        output_dir (str): Directory to save into (created if missing).
+    """
     os.makedirs(output_dir, exist_ok=True)
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
@@ -84,6 +126,13 @@ def _save_adapter_only(model, tokenizer, output_dir: str) -> None:
 
 
 def _save_merged(model, tokenizer, output_dir: str) -> None:
+    """Merge the LoRA adapter into the base model and save the result standalone.
+
+    Args:
+        model: PeftModel to merge and save.
+        tokenizer: Tokenizer to save.
+        output_dir (str): Directory to save into (created if missing).
+    """
     os.makedirs(output_dir, exist_ok=True)
     merged = model.merge_and_unload()
     merged.save_pretrained(output_dir)
@@ -92,6 +141,13 @@ def _save_merged(model, tokenizer, output_dir: str) -> None:
 
 
 def _save_base_reference(output_dir: str, base_model_name: Optional[str]) -> None:
+    """Write a small JSON pointer file recording the base checkpoint used.
+
+    Args:
+        output_dir (str): Directory to write `base_model.json` into (created
+            if missing).
+        base_model_name (Optional[str]): Base checkpoint id/path to record.
+    """
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, "base_model.json"), "w") as f:
         json.dump({"base_model_name": base_model_name}, f, indent=2)

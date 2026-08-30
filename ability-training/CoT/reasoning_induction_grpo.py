@@ -57,6 +57,13 @@ ANSWER_LETTER_RE = re.compile(r"\b([A-D])\b")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model/quantization, LoRA,
+        GRPO reward and generation, training, sampling, output, and
+        debug/seed options.
+    """
     p = argparse.ArgumentParser(description="Induce CoT reasoning via GRPO with a correctness + format reward.")
 
     p.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B", help="Instruction-tuned checkpoint that does NOT already habitually use <think> tags (local path or HF Hub id). Default: Qwen/Qwen3-1.7B (plain instruct, not the -Thinking variant).")
@@ -98,6 +105,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def format_question(row) -> str:
+    """Render a MedMCQA row's question and four options as plain text.
+
+    Args:
+        row: Mapping with "Question", "Option_A", "Option_B", "Option_C",
+            and "Option_D" keys.
+
+    Returns:
+        str: The question followed by lettered options A-D, one per line.
+    """
     return (
         f"{row['Question']}\n\n"
         f"A. {row['Option_A']}\n"
@@ -108,10 +124,26 @@ def format_question(row) -> str:
 
 
 def build_prompt(row) -> str:
+    """Wrap a formatted question in the instruction/input/response template.
+
+    Args:
+        row: Mapping with "Question", "Option_A", "Option_B", "Option_C",
+            and "Option_D" keys.
+
+    Returns:
+        str: Full prompt text ending at "### Response:\\n", ready for
+        generation.
+    """
     return f"### Instruction:\n{INSTRUCTION}\n\n### Input:\n{format_question(row)}\n\n### Response:\n"
 
 
 def verify_dataset() -> None:
+    """Peek at the training split via streaming and assert expected fields exist.
+
+    Raises:
+        AssertionError: If any of the expected MedMCQA fields is missing
+            from the first streamed example.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train", streaming=True)
     example = next(iter(peek))
@@ -124,6 +156,16 @@ def verify_dataset() -> None:
 
 
 def load_and_prepare_data(args):
+    """Load the MedMCQA train/dev splits and convert rows into GRPO prompts.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses max_samples,
+            sample_selection, max_eval_samples, and seed.
+
+    Returns:
+        tuple[datasets.Dataset, datasets.Dataset]: Train and eval datasets,
+        each with "prompt" and "answer" columns.
+    """
     print_banner("LOADING DATASET")
     train_raw = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train")
     # Not split="test": its Label field is None for every row (found while building
@@ -134,6 +176,7 @@ def load_and_prepare_data(args):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def to_prompt_dataset(examples):
+        """Map a batch of raw MedMCQA rows to {"prompt", "answer"} columns."""
         return {
             "prompt": [build_prompt({"Question": q, "Option_A": a, "Option_B": b, "Option_C": c, "Option_D": d}) for q, a, b, c, d in zip(examples["Question"], examples["Option_A"], examples["Option_B"], examples["Option_C"], examples["Option_D"])],
             "answer": examples["Label"],
@@ -149,9 +192,18 @@ def load_and_prepare_data(args):
 
 
 def extract_answer_letter(completion: str):
-    """Prefer the letter after </think> if a think block is present (the
-    'final answer' should follow the reasoning); fall back to the first
-    standalone letter anywhere in the completion otherwise."""
+    """Extract the model's final answer letter from a completion.
+
+    Prefers the letter after </think> if a think block is present (the
+    "final answer" should follow the reasoning); falls back to the first
+    standalone letter anywhere in the completion otherwise.
+
+    Args:
+        completion (str): Raw model completion text.
+
+    Returns:
+        str | None: The matched letter (A-D), or None if no letter was found.
+    """
     think_match = THINK_BLOCK_RE.search(completion)
     search_region = completion[think_match.end():] if think_match else completion
     match = ANSWER_LETTER_RE.search(search_region.strip().upper())
@@ -159,15 +211,39 @@ def extract_answer_letter(completion: str):
 
 
 def correctness_reward(prompts, completions, answer, **kwargs) -> list:
-    """Verifiable reward: 1.0 if the final answer letter is correct, else 0.0."""
+    """Verifiable GRPO reward: 1.0 if the final answer letter is correct, else 0.0.
+
+    Args:
+        prompts: Unused; accepted because TRL's GRPOTrainer always passes it
+            to reward functions.
+        completions (list[str]): Model completions for this batch.
+        answer (list[str]): Ground-truth answer letters, aligned with
+            completions.
+        **kwargs: Additional TRL-supplied fields, unused.
+
+    Returns:
+        list[float]: One reward per completion, 1.0 or 0.0.
+    """
     return [1.0 if extract_answer_letter(c) == a else 0.0 for c, a in zip(completions, answer)]
 
 
 def format_reward(prompts, completions, **kwargs) -> list:
-    """Reward for well-formed <think>...</think> structure with non-trivial content,
-    independent of whether the final answer is correct -- this is what actually
-    induces the *habit* of producing structured reasoning, separate from just
-    getting answers right."""
+    """GRPO reward for well-formed, non-trivial <think>...</think> structure.
+
+    Independent of whether the final answer is correct -- this is what
+    actually induces the *habit* of producing structured reasoning, separate
+    from just getting answers right.
+
+    Args:
+        prompts: Unused; accepted because TRL's GRPOTrainer always passes it
+            to reward functions.
+        completions (list[str]): Model completions for this batch.
+        **kwargs: Additional TRL-supplied fields, unused.
+
+    Returns:
+        list[float]: One reward per completion -- 1.0 if it contains a
+        <think> block with at least 3 words, else 0.0.
+    """
     rewards = []
     for completion in completions:
         match = THINK_BLOCK_RE.search(completion)
@@ -179,6 +255,15 @@ def format_reward(prompts, completions, **kwargs) -> list:
 
 
 def print_debug_examples(train_dataset) -> None:
+    """Print reward values for hand-built fake completions plus a sample prompt.
+
+    Used by --debug_first_batch to sanity-check correctness_reward and
+    format_reward before spending compute on real training.
+
+    Args:
+        train_dataset (datasets.Dataset): Training dataset with "prompt" and
+            "answer" columns.
+    """
     print_banner("REWARD FUNCTION SANITY CHECK")
     sample_answers = train_dataset["answer"][:3]
     fake_completions = [
@@ -197,9 +282,24 @@ def print_debug_examples(train_dataset) -> None:
 
 
 def evaluate_cot_usage_rate(model, tokenizer, eval_dataset, args, num_samples: int = 20) -> float:
-    """Separate from GRPOTrainer's own eval loop (which reports mean reward but
-    not this specific interpretable metric): what fraction of eval completions
-    spontaneously use well-formed <think> tags after training?"""
+    """Measure the fraction of greedy eval completions that use <think> tags.
+
+    Separate from GRPOTrainer's own eval loop (which reports mean reward but
+    not this specific interpretable metric): what fraction of eval
+    completions spontaneously use well-formed <think> tags after training?
+
+    Args:
+        model: Trained policy model to generate from.
+        tokenizer: Tokenizer/processor matching model.
+        eval_dataset (datasets.Dataset): Eval dataset with a "prompt" column.
+        args (argparse.Namespace): Parsed CLI args; uses max_completion_length.
+        num_samples (int): Number of eval rows to sample from, capped at the
+            dataset size. Defaults to 20.
+
+    Returns:
+        float: Fraction (0.0-1.0) of sampled completions containing a
+        well-formed <think> block, or 0.0 if no rows were sampled.
+    """
     import torch
 
     model.eval()
@@ -217,6 +317,12 @@ def evaluate_cot_usage_rate(model, tokenizer, eval_dataset, args, num_samples: i
 
 
 def main():
+    """Parse CLI args, run GRPO CoT-induction training, and write results.
+
+    Loads data, optionally exits early for --debug_first_batch, otherwise
+    builds quantization/LoRA configs, trains with GRPOTrainer, evaluates,
+    measures CoT usage rate, saves the model, and writes a run_result.json.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "CoT/reasoning induction via GRPO (RLVR: correctness + format reward)")

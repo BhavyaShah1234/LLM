@@ -44,6 +44,13 @@ ARCHITECTURE = "decoder-only"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this benchmark.
+
+    Returns:
+        argparse.ArgumentParser: Parser with all benchmark options (model,
+        synthetic-batch shape, step counts, mixed precision, seed, output
+        dir, debug flag) registered.
+    """
     p = argparse.ArgumentParser(description="Benchmark training with vs. without gradient checkpointing.")
     p.add_argument("--model", type=str, default="./output/pretraining/clm", help="Model to benchmark (local path or HF Hub id). Default: this project's own from-scratch CLM checkpoint.")
     p.add_argument("--batch_size", type=int, default=16, help="Synthetic batch size. Default: 16.")
@@ -58,6 +65,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def build_synthetic_batch(vocab_size: int, batch_size: int, seq_len: int, device: str):
+    """Build a random-token CLM batch used to drive both benchmark configurations.
+
+    Args:
+        vocab_size (int): Vocabulary size to sample token ids from.
+        batch_size (int): Number of sequences in the batch.
+        seq_len (int): Length of each sequence.
+        device (str): Torch device to place the tensors on.
+
+    Returns:
+        dict: `{"input_ids", "attention_mask", "labels"}` tensors, with
+        `labels` a clone of `input_ids` (standard CLM setup).
+    """
     input_ids = torch.randint(low=0, high=vocab_size, size=(batch_size, seq_len), device=device)
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.clone()
@@ -65,6 +84,17 @@ def build_synthetic_batch(vocab_size: int, batch_size: int, seq_len: int, device
 
 
 def load_model(model_name: str, dtype: torch.dtype, gradient_checkpointing: bool, device: str):
+    """Load a causal LM in train mode, optionally with gradient checkpointing enabled.
+
+    Args:
+        model_name (str): Local path or HF Hub id of the checkpoint to load.
+        dtype (torch.dtype): Dtype to load model weights in.
+        gradient_checkpointing (bool): If True, enable gradient checkpointing and disable the KV cache (required, since cached states are incompatible with backward-pass recomputation).
+        device (str): Torch device to move the model to.
+
+    Returns:
+        transformers.PreTrainedModel: The loaded model in `.train()` mode.
+    """
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, trust_remote_code=True).to(device)
@@ -76,6 +106,20 @@ def load_model(model_name: str, dtype: torch.dtype, gradient_checkpointing: bool
 
 
 def run_benchmark(model, batch, num_steps: int, num_warmup: int, device: str):
+    """Time forward+backward steps for one model configuration.
+
+    Args:
+        model (transformers.PreTrainedModel): Model to benchmark, already in train mode on `device`.
+        batch (dict): Batch from `build_synthetic_batch`, already on `device`.
+        num_steps (int): Timed forward+backward steps to run after warmup.
+        num_warmup (int): Untimed warmup steps run before timing starts.
+        device (str): Torch device the model and batch live on.
+
+    Returns:
+        tuple[float, float, float]: `(avg_step_seconds, peak_memory_mb, final_loss)`
+        -- mean wall-clock time per timed step, peak CUDA memory allocated
+        during the timed steps in MB, and the loss from the last timed step.
+    """
     for _ in range(num_warmup):
         model.zero_grad(set_to_none=True)
         outputs = model(**batch)
@@ -99,6 +143,13 @@ def run_benchmark(model, batch, num_steps: int, num_warmup: int, device: str):
 
 
 def main():
+    """Run the with/without gradient-checkpointing benchmark and write a `run_result.json`.
+
+    Parses CLI args, builds a synthetic CLM batch, benchmarks both
+    configurations (or just one debug step of each if
+    `--debug_first_batch` is set), prints a summary, and records the
+    comparison via `common.run_results.write_run_result`.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Gradient checkpointing benchmark")

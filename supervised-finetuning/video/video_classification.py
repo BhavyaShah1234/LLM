@@ -66,6 +66,12 @@ ARCHITECTURE = "encoder-only"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model, optimization,
+        data-selection, output, and debug flags.
+    """
     p = argparse.ArgumentParser(description="SFT a VideoMAE model for video classification.")
 
     p.add_argument("--model", type=str, default="MCG-NJU/videomae-base", help="VideoMAE checkpoint (no classification head -- one is trained fresh). Default: MCG-NJU/videomae-base (fp32 ~340MB).")
@@ -95,6 +101,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset() -> None:
+    """Stream one example from DATASET_NAME and sanity-check its fields.
+
+    Asserts that `video` and `label` are both present, and prints a
+    preview. Not called from `main()` by default (see the comment there)
+    but kept for manual verification.
+
+    Raises:
+        AssertionError: If either expected field is missing from the dataset.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -108,6 +123,18 @@ def verify_dataset() -> None:
 
 
 def sample_frames(video, num_frames: int) -> list:
+    """Uniformly sample and decode a fixed number of frames from a clip.
+
+    Args:
+        video: A `torchcodec.decoders.VideoDecoder`-backed dataset video
+            column value.
+        num_frames (int): Number of frames to sample (evenly spaced across
+            the clip, via `np.linspace`).
+
+    Returns:
+        list: `num_frames` HxWxC uint8 numpy arrays, in the layout the
+        image processor expects.
+    """
     total = len(video)
     indices = np.linspace(0, total - 1, num_frames).astype(int).tolist()
     frames = video.get_frames_at(indices=indices)
@@ -115,10 +142,20 @@ def sample_frames(video, num_frames: int) -> list:
 
 
 def fix_videomae_attention_bias(model, checkpoint_name: str) -> None:
-    """See module docstring: the checkpoint stores q_bias/v_bias (no key
+    """Copy VideoMAE's q_bias/v_bias checkpoint tensors into the loaded model.
+
+    See module docstring: the checkpoint stores q_bias/v_bias (no key
     bias, by original-architecture design); this project's transformers
     version expects separate query/key/value.bias and leaves them at zero
-    when it can't find a match. Copies the real values back in.
+    when it can't find a match. Copies the real values back in, per
+    encoder layer, by downloading and reading the checkpoint's raw
+    safetensors file.
+
+    Args:
+        model: The loaded `AutoModelForVideoClassification` instance whose
+            backbone attention biases need correcting.
+        checkpoint_name (str): Hub checkpoint id to download
+            `model.safetensors` from.
     """
     backbone = getattr(model, model.base_model_prefix)
     path = hf_hub_download(checkpoint_name, "model.safetensors")
@@ -136,6 +173,21 @@ def fix_videomae_attention_bias(model, checkpoint_name: str) -> None:
 
 
 def load_and_prepare_data(args, processor, num_frames: int):
+    """Load the train/validation splits and attach a frame-sampling transform.
+
+    Args:
+        args: Parsed CLI namespace; uses `max_samples`, `sample_selection`,
+            `max_eval_samples`, and `seed`.
+        processor: The model's `AutoImageProcessor`, used inside the
+            attached transform to preprocess sampled frames.
+        num_frames (int): Number of frames to sample per clip (see
+            `sample_frames`).
+
+    Returns:
+        tuple: `(train_dataset, eval_dataset, class_names)` where the first
+        two are HF `Dataset`s with a lazy `with_transform` frame-sampling
+        pipeline attached, and `class_names` is the list of label names.
+    """
     print_banner("LOADING DATASET")
     train_raw = load_dataset(DATASET_NAME, split="train")
     eval_raw = load_dataset(DATASET_NAME, split="validation")
@@ -147,6 +199,7 @@ def load_and_prepare_data(args, processor, num_frames: int):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def transform(examples):
+        """Sample and preprocess frames for a batch of examples (lazy, per-access)."""
         pixel_values = []
         for video in examples["video"]:
             frames = sample_frames(video, num_frames)
@@ -164,12 +217,33 @@ def load_and_prepare_data(args, processor, num_frames: int):
 
 
 def collate_fn(batch):
+    """Stack a list of transformed examples into a training batch.
+
+    Args:
+        batch: List of dicts with `pixel_values` and `labels` keys, as
+            produced by the `transform` closure in `load_and_prepare_data`.
+
+    Returns:
+        dict: Batched `pixel_values` and `labels` tensors.
+    """
     pixel_values = torch.stack([item["pixel_values"] for item in batch])
     labels = torch.tensor([item["labels"] for item in batch])
     return {"pixel_values": pixel_values, "labels": labels}
 
 
 def print_formatted_examples_video(dataset, class_names, num_examples: int = 2) -> None:
+    """Print pixel-tensor shape and label info for a few dataset examples.
+
+    Used by `--debug_first_batch` to visually confirm preprocessing before
+    committing to a full training run.
+
+    Args:
+        dataset: A transformed dataset (see `load_and_prepare_data`) to
+            sample from.
+        class_names: List of label names, indexed by label id.
+        num_examples (int): Maximum number of examples to print. Defaults
+            to 2.
+    """
     print_banner("FORMATTED EXAMPLES")
     for i in range(min(num_examples, len(dataset))):
         example = dataset[i]
@@ -180,6 +254,16 @@ def print_formatted_examples_video(dataset, class_names, num_examples: int = 2) 
 
 
 def compute_metrics(eval_pred):
+    """Compute classification metrics from Trainer eval predictions.
+
+    Args:
+        eval_pred: `(logits, labels)` tuple as passed by
+            `transformers.Trainer`'s `compute_metrics` hook.
+
+    Returns:
+        dict: `accuracy`, `f1_macro`, `precision`, and `recall`
+        (macro-averaged).
+    """
     logits, labels = eval_pred
     predictions = np.argmax(logits, axis=-1)
     return {
@@ -191,6 +275,13 @@ def compute_metrics(eval_pred):
 
 
 def main():
+    """Run the full video classification SFT pipeline: load, train, evaluate, save, record.
+
+    Parses CLI args, loads the base VideoMAE model (fixing its checkpoint's
+    attention-bias key mismatch), either dumps formatted debug examples and
+    exits or trains via `Trainer`, evaluates the result, saves the model,
+    and writes a `run_result.json`.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Video classification SFT (VideoMAE)")

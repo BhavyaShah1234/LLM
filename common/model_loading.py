@@ -40,6 +40,20 @@ def build_model_from_scratch(
     """Random-init a model matching `config`'s architecture. No pretrained
     weights are downloaded or loaded -- this is genuinely training from
     scratch, which is the entire point of the pretraining/ stage.
+
+    Args:
+        architecture_family (str): One of "decoder-only", "encoder-only", or
+            "encoder-decoder"; selects which AutoModel class to instantiate.
+        config (PretrainedConfig): Model config to build the random-init
+            model from.
+        gradient_checkpointing (bool): Whether to enable gradient
+            checkpointing on the resulting model.
+
+    Returns:
+        PreTrainedModel: A freshly initialized (untrained) model.
+
+    Raises:
+        ValueError: If `architecture_family` isn't a recognized key.
     """
     try:
         automodel_cls = _ARCHITECTURE_TO_AUTOMODEL[architecture_family]
@@ -55,6 +69,18 @@ def build_model_from_scratch(
 
 
 def load_tokenizer(model_name: str, use_fast: bool = True, ensure_pad_token: bool = True) -> PreTrainedTokenizerBase:
+    """Load a tokenizer from a local path or HF Hub id.
+
+    Args:
+        model_name (str): Local path or HF Hub model id to load the
+            tokenizer from.
+        use_fast (bool): Whether to prefer the fast (Rust-backed) tokenizer.
+        ensure_pad_token (bool): If True and the tokenizer has no pad token,
+            set it to the EOS token (needed by many decoder-only models).
+
+    Returns:
+        PreTrainedTokenizerBase: The loaded tokenizer.
+    """
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=use_fast, trust_remote_code=True)
     if ensure_pad_token and tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -68,6 +94,21 @@ def load_causal_lm(
     gradient_checkpointing: bool = True,
     trust_remote_code: bool = True,
 ) -> PreTrainedModel:
+    """Load a pretrained causal LM, optionally quantized.
+
+    Args:
+        model_name (str): Local path or HF Hub model id to load.
+        quantization_config (Optional[BitsAndBytesConfig]): bitsandbytes
+            config for 4-bit/8-bit loading; None loads in full precision.
+        torch_dtype (torch.dtype): Compute dtype for unquantized weights.
+        gradient_checkpointing (bool): Whether to enable gradient
+            checkpointing on the loaded model.
+        trust_remote_code (bool): Passed through to `from_pretrained`; allows
+            model repos with custom modeling code.
+
+    Returns:
+        PreTrainedModel: The loaded causal LM.
+    """
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=quantization_config,
@@ -87,6 +128,21 @@ def load_vision_language_model(
     gradient_checkpointing: bool = True,
     model_class=None,
 ) -> PreTrainedModel:
+    """Load a pretrained vision-language model, optionally quantized.
+
+    Args:
+        model_name (str): Local path or HF Hub model id to load.
+        quantization_config (Optional[BitsAndBytesConfig]): bitsandbytes
+            config for 4-bit/8-bit loading; None loads in full precision.
+        torch_dtype (torch.dtype): Compute dtype for unquantized weights.
+        gradient_checkpointing (bool): Whether to enable gradient
+            checkpointing on the loaded model.
+        model_class: AutoModel-style class to instantiate; defaults to
+            `Qwen2VLForConditionalGeneration` when not given.
+
+    Returns:
+        PreTrainedModel: The loaded vision-language model.
+    """
     if model_class is None:
         from transformers import Qwen2VLForConditionalGeneration
 

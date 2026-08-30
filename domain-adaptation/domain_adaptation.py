@@ -50,6 +50,12 @@ ARCHITECTURE = "decoder-only"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model/quantization, LoRA,
+        packing/sampling, training, and output/debug options.
+    """
     p = argparse.ArgumentParser(description="Domain-adapt a decoder-only checkpoint (CLM objective) to medical text.")
 
     p.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B-Base", help="Base checkpoint to domain-adapt. Default: Qwen/Qwen3-1.7B-Base.")
@@ -89,6 +95,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset() -> None:
+    """Peek at the training split via streaming and assert an "Explanation" field exists.
+
+    Raises:
+        AssertionError: If the first streamed example has no "Explanation"
+            field.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train", streaming=True)
     example = next(iter(peek))
@@ -100,13 +112,28 @@ def verify_dataset() -> None:
 
 
 def tokenize_and_pack(dataset, tokenizer, block_size: int, desc: str):
+    """Tokenize MedMCQA explanations and pack them into fixed-length CLM blocks.
+
+    Args:
+        dataset (datasets.Dataset): Raw dataset with an "Explanation" column.
+        tokenizer: Tokenizer to encode text with.
+        block_size (int): Number of tokens per packed training block.
+        desc (str): Short label used in progress-bar descriptions (e.g.
+            "train" or "eval").
+
+    Returns:
+        datasets.Dataset: Dataset of fixed-length "input_ids"/"labels"
+        blocks, with any trailing tokens shorter than block_size dropped.
+    """
     def tokenize_fn(examples):
+        """Tokenize a batch, dropping empty explanations and appending EOS."""
         non_empty = [t + tokenizer.eos_token for t in examples["Explanation"] if t and t.strip()]
         return tokenizer(non_empty)
 
     tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=dataset.column_names, desc=f"Tokenizing ({desc})")
 
     def group_texts(examples):
+        """Concatenate a tokenized batch and split it into block_size chunks."""
         concatenated = {k: sum(examples[k], []) for k in examples.keys()}
         total_length = (len(concatenated["input_ids"]) // block_size) * block_size
         result = {
@@ -120,6 +147,17 @@ def tokenize_and_pack(dataset, tokenizer, block_size: int, desc: str):
 
 
 def load_and_prepare_data(args, tokenizer):
+    """Load the MedMCQA train/dev splits and tokenize+pack their explanations.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses max_samples,
+            sample_selection, max_eval_samples, seed, and block_size.
+        tokenizer: Tokenizer to encode text with.
+
+    Returns:
+        tuple[datasets.Dataset, datasets.Dataset]: Packed train and eval
+        datasets of fixed-length blocks.
+    """
     print_banner("LOADING DATASET")
     raw_train = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train")
     raw_eval = load_dataset(DATASET_NAME, DATASET_CONFIG, split="dev")
@@ -140,11 +178,29 @@ def load_and_prepare_data(args, tokenizer):
 
 
 def decode_example(example, index, tokenizer):
+    """Decode a single packed block back to text for --debug_first_batch display.
+
+    Args:
+        example (dict): One packed dataset row with an "input_ids" field.
+        index (int): Row index; unused, present for print_formatted_examples'
+            decode_fn signature.
+        tokenizer: Tokenizer to decode input_ids with.
+
+    Returns:
+        str: Human-readable summary of the block's token count and text.
+    """
     text = tokenizer.decode(example["input_ids"])
     return f"Packed block ({len(example['input_ids'])} tokens):\n{text}"
 
 
 def main():
+    """Parse CLI args, run domain-adaptation training, and write results.
+
+    Loads the tokenizer/checkpoint, prepares packed data, optionally exits
+    early for --debug_first_batch, otherwise applies quantization/LoRA,
+    trains with Trainer, evaluates perplexity, saves the model, and writes a
+    run_result.json.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Domain adaptation (decoder-only, CLM) -- specializing to medical text")

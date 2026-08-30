@@ -53,6 +53,13 @@ SYSTEM_INSTRUCTIONS = [
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for the CoT code-instruction-tuning run.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model/quantization, LoRA,
+            optimization, data-selection, output/checkpointing, and
+            seed/debug flags for this script.
+    """
     p = argparse.ArgumentParser(description="SFT a decoder-only model for instruction tuning (with CoT, code).")
 
     p.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B-Base", help="Base checkpoint. Default: Qwen/Qwen3-1.7B-Base.")
@@ -92,21 +99,72 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def clean_thinking(thinking: str) -> str:
+    """Strip stray `<think>` tags and truncate a raw thinking field.
+
+    Args:
+        thinking (str): Raw "thinking" text from the dataset row.
+
+    Returns:
+        str: Cleaned, truncated (<=800 char) reasoning text, or a generic
+            fallback sentence if the cleaned text is empty.
+    """
     thinking = str(thinking).replace("<think>", "").replace("</think>", "").strip()[:800]
     return thinking or "Reasoning through the task before writing the solution."
 
 
 class InstructionCoTDataset(Dataset):
+    """Tokenized code-instruction dataset with CoT supervision.
+
+    Formats each row as an instruction/response prompt (with a randomly
+    sampled system instruction) where the response is a `<think>` reasoning
+    span followed by the code response, and masks the loss on the
+    instruction/input prefix only (loss is computed on both the thinking
+    and response tokens).
+
+    Attributes:
+        rows (list): Raw dataset rows (dicts with "instruction", "thinking",
+            "response").
+        tokenizer: Tokenizer used to encode prompts and responses.
+        max_length (int): Max token length the full prompt+response is
+            truncated to.
+        rng (random.Random): RNG used to sample a system instruction per
+            example.
+    """
+
     def __init__(self, rows, tokenizer, max_length: int, seed: int):
+        """Initialize the dataset from raw rows.
+
+        Args:
+            rows (list): Raw dataset rows (dicts with "instruction",
+                "thinking", "response").
+            tokenizer: Tokenizer used to encode prompts and responses.
+            max_length (int): Max token length for truncation.
+            seed (int): Seed for the system-instruction sampling RNG.
+        """
         self.rows = rows
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.rng = random.Random(seed)
 
     def __len__(self):
+        """Return the number of rows in the dataset.
+
+        Returns:
+            int: Number of rows.
+        """
         return len(self.rows)
 
     def __getitem__(self, idx):
+        """Build the tokenized prompt/response pair for one row.
+
+        Args:
+            idx (int): Row index.
+
+        Returns:
+            dict: `input_ids`, `attention_mask`, and `labels` (with the
+                instruction/input prefix masked to -100, loss on the
+                thinking + response tokens).
+        """
         row = self.rows[idx]
         instruction = self.rng.choice(SYSTEM_INSTRUCTIONS)
         thinking = clean_thinking(row["thinking"])
@@ -127,6 +185,12 @@ class InstructionCoTDataset(Dataset):
 
 
 def verify_dataset() -> None:
+    """Peek the dataset (streaming) and assert the expected fields exist.
+
+    Raises:
+        AssertionError: If `instruction`, `thinking`, or `response` is
+            missing from the first streamed example.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -138,6 +202,18 @@ def verify_dataset() -> None:
 
 
 def load_and_prepare_data(args, tokenizer):
+    """Load the dataset, carve out an eval split, and wrap both in datasets.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `max_samples`,
+            `sample_selection`, `max_eval_samples`, `seed`, and `max_length`.
+        tokenizer: Tokenizer passed through to the built datasets.
+
+    Returns:
+        tuple: `(train_dataset, eval_dataset, eval_rows)` where the first two
+            are `InstructionCoTDataset` instances and `eval_rows` is the raw
+            (untokenized) eval rows used for generation-based evaluation.
+    """
     print_banner("LOADING DATASET")
     all_raw = load_dataset(DATASET_NAME, split="train")
 
@@ -164,6 +240,18 @@ def load_and_prepare_data(args, tokenizer):
 
 
 def decode_example(example, index, tokenizer):
+    """Render one tokenized training example as human-readable text for debug printing.
+
+    Args:
+        example (dict): Tokenized example with `input_ids` and `labels`.
+        index (int): Position of this example in the batch (unused, kept for
+            the shared `decode_fn` signature used by `print_formatted_examples`).
+        tokenizer: Tokenizer used to decode the token ids back to text.
+
+    Returns:
+        str: The full prompt+response text, plus the decoded response
+            (thinking + answer) that loss is actually computed on.
+    """
     input_ids = example["input_ids"]
     labels = example["labels"]
     full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
@@ -173,6 +261,24 @@ def decode_example(example, index, tokenizer):
 
 
 def evaluate_model(model, tokenizer, eval_rows, args):
+    """Generate CoT + code responses on the eval rows and score them.
+
+    Parses each generation's `<think>...</think>` span for the CoT text and
+    treats the remaining text as the code response, then scores the
+    response against the reference with ROUGE-L and BERTScore.
+
+    Args:
+        model: The (possibly LoRA-wrapped) causal LM to evaluate.
+        tokenizer: Tokenizer used for prompting and decoding generations.
+        eval_rows (list): Raw eval rows (dicts with "instruction",
+            "response").
+        args (argparse.Namespace): Parsed CLI args; uses `max_length`
+            and `seed`.
+
+    Returns:
+        dict: ROUGE-L, BERTScore F1 (`None` if scoring failed), CoT usage
+            rate, and average CoT length in words.
+    """
     print_banner("EVALUATION")
     model.eval()
     predictions, references, cot_outputs = [], [], []
@@ -223,6 +329,12 @@ def evaluate_model(model, tokenizer, eval_rows, args):
 
 
 def main():
+    """Run the full CoT code-instruction-tuning SFT pipeline end to end.
+
+    Parses CLI args, loads the tokenizer/dataset/model (optionally
+    quantized/LoRA), either prints a debug batch and exits or trains,
+    evaluates, saves the model, and writes a `run_result.json`.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Instruction tuning SFT -- decoder-only, with CoT (code)")

@@ -48,6 +48,13 @@ DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this benchmark.
+
+    Returns:
+        argparse.ArgumentParser: Parser with all benchmark options (model,
+        synthetic-batch shape, step counts, seed, output dir, debug flag)
+        registered.
+    """
     p = argparse.ArgumentParser(description="Benchmark fp32 vs fp16 vs bf16 on real forward+backward passes.")
     p.add_argument("--model", type=str, default="./output/pretraining/clm", help="Model to benchmark (local path or HF Hub id). Default: this project's own from-scratch CLM checkpoint (51M params) -- fp32 of a larger model like Qwen3-1.7B-Base doesn't fit on an 8GB card at all, see module docstring.")
     p.add_argument("--batch_size", type=int, default=8, help="Synthetic batch size. Default: 8.")
@@ -61,6 +68,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def build_synthetic_batch(vocab_size: int, batch_size: int, seq_len: int, device: str):
+    """Build a random-token CLM batch used to drive all three dtype configurations.
+
+    Args:
+        vocab_size (int): Vocabulary size to sample token ids from.
+        batch_size (int): Number of sequences in the batch.
+        seq_len (int): Length of each sequence.
+        device (str): Torch device to place the tensors on.
+
+    Returns:
+        dict: `{"input_ids", "attention_mask", "labels"}` tensors, with
+        `labels` a clone of `input_ids` (standard CLM setup).
+    """
     input_ids = torch.randint(low=0, high=vocab_size, size=(batch_size, seq_len), device=device)
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.clone()
@@ -68,6 +87,16 @@ def build_synthetic_batch(vocab_size: int, batch_size: int, seq_len: int, device
 
 
 def load_model_with_dtype(model_name: str, dtype: torch.dtype, device: str):
+    """Load a causal LM in train mode at a given dtype.
+
+    Args:
+        model_name (str): Local path or HF Hub id of the checkpoint to load.
+        dtype (torch.dtype): Dtype to load model weights in (fp32, fp16, or bf16).
+        device (str): Torch device to move the model to.
+
+    Returns:
+        transformers.PreTrainedModel: The loaded model in `.train()` mode.
+    """
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, trust_remote_code=True).to(device)
@@ -76,6 +105,22 @@ def load_model_with_dtype(model_name: str, dtype: torch.dtype, device: str):
 
 
 def run_benchmark(model, batch, num_steps: int, num_warmup: int, device: str):
+    """Time forward+backward steps for one dtype, tracking whether the loss ever goes NaN.
+
+    Args:
+        model (transformers.PreTrainedModel): Model to benchmark, already in train mode on `device`.
+        batch (dict): Batch from `build_synthetic_batch`, already on `device`.
+        num_steps (int): Timed forward+backward steps to run after warmup.
+        num_warmup (int): Untimed warmup steps run before timing starts.
+        device (str): Torch device the model and batch live on.
+
+    Returns:
+        tuple[float, float, float, bool]: `(avg_step_seconds, peak_memory_mb,
+        final_loss, nan_seen)` -- mean wall-clock time per timed step, peak
+        CUDA memory allocated during the timed steps in MB, the loss from
+        the last timed step, and whether any timed step's loss was NaN
+        (relevant mainly for fp16, which can overflow).
+    """
     nan_seen = False
     for _ in range(num_warmup):
         model.zero_grad(set_to_none=True)
@@ -102,6 +147,14 @@ def run_benchmark(model, batch, num_steps: int, num_warmup: int, device: str):
 
 
 def main():
+    """Run the fp32/fp16/bf16 benchmark and write a `run_result.json`.
+
+    Parses CLI args, builds a synthetic CLM batch, benchmarks each dtype
+    in `DTYPES` (or just one debug step of each if `--debug_first_batch`
+    is set), prints a summary comparing fp16/bf16 against the fp32
+    baseline, and records the comparison via
+    `common.run_results.write_run_result`.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Mixed precision (fp32 vs fp16 vs bf16) benchmark")

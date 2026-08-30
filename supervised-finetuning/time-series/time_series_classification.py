@@ -41,6 +41,12 @@ DATASET_NAME = "mineshj1291/ecg-classification"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model architecture,
+        optimization, data-selection, output, and debug flags.
+    """
     p = argparse.ArgumentParser(description="Train a from-scratch 1D-CNN (FCN baseline) for time-series classification.")
 
     p.add_argument("--channels", type=str, default="64,128,64", help="Comma-separated Conv1d channel widths for the 3 conv blocks. Default: 64,128,64 (the standard UCR-benchmark FCN baseline width).")
@@ -67,6 +73,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset() -> None:
+    """Stream one example from DATASET_NAME and sanity-check its fields.
+
+    Asserts that `signals` and `labels` are both present, and prints a
+    preview. Not called from `main()` by default (see the comment there)
+    but kept for manual verification.
+
+    Raises:
+        AssertionError: If either expected field is missing from the dataset.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -80,14 +95,43 @@ def verify_dataset() -> None:
 
 
 class TimeSeriesDataset(Dataset):
+    """Torch dataset that per-channel-normalizes ECG signal rows for the FCN.
+
+    Attributes:
+        rows: List of raw row dicts with `signals` and `labels` keys.
+        channel_stats: List of `(mean, std)` tuples, one per channel,
+            computed from the TRAIN split only (to avoid eval leakage).
+    """
+
     def __init__(self, rows, channel_stats):
+        """Initialize the dataset.
+
+        Args:
+            rows: List of raw row dicts (see class docstring).
+            channel_stats: List of `(mean, std)` per-channel normalization
+                stats, as returned by `compute_channel_stats`.
+        """
         self.rows = rows
         self.channel_stats = channel_stats  # list of (mean, std), one per channel, computed from TRAIN split only
 
     def __len__(self):
+        """Return the number of rows in the dataset.
+
+        Returns:
+            int: Number of rows.
+        """
         return len(self.rows)
 
     def __getitem__(self, idx):
+        """Build the normalized signal/label tensor pair for one row.
+
+        Args:
+            idx: Index of the row to fetch.
+
+        Returns:
+            dict: `signal` ((channels, timesteps) float tensor, normalized
+            per-channel) and `labels` (scalar long tensor).
+        """
         row = self.rows[idx]
         signal = torch.tensor(row["signals"], dtype=torch.float32)  # (channels, timesteps)
         for c in range(signal.shape[0]):
@@ -98,6 +142,18 @@ class TimeSeriesDataset(Dataset):
 
 
 def compute_channel_stats(train_raw, num_channels: int):
+    """Compute per-channel mean/std normalization stats from the train split.
+
+    Args:
+        train_raw: The raw (unnormalized) training `Dataset`, with a
+            `signals` field of shape (channels, timesteps) per row.
+        num_channels (int): Number of signal channels.
+
+    Returns:
+        list: `(mean, std)` tuples, one per channel, computed by
+        concatenating that channel's values across all training rows (std
+        is floored with a small epsilon to avoid division by zero).
+    """
     stats = []
     for c in range(num_channels):
         values = np.concatenate([np.array(row["signals"][c]) for row in train_raw])
@@ -109,9 +165,23 @@ class FCN(nn.Module):
     """The standard "Fully Convolutional Network" baseline for UCR-style
     time-series classification: stacked Conv1d/BatchNorm/ReLU blocks,
     global average pooling over the time axis, linear classifier.
+
+    Attributes:
+        conv_blocks: Sequential stack of Conv1d/BatchNorm1d/ReLU blocks.
+        classifier: Final linear layer mapping pooled channel features to
+            class logits.
     """
 
     def __init__(self, in_channels: int, channels: list, kernel_sizes: list, num_classes: int):
+        """Build the conv blocks and classifier head.
+
+        Args:
+            in_channels (int): Number of input signal channels.
+            channels (list): Output channel width for each conv block.
+            kernel_sizes (list): Conv1d kernel size for each conv block
+                (same length as `channels`).
+            num_classes (int): Number of output classes.
+        """
         super().__init__()
         layers = []
         prev = in_channels
@@ -122,12 +192,31 @@ class FCN(nn.Module):
         self.classifier = nn.Linear(prev, num_classes)
 
     def forward(self, x):
+        """Run the conv blocks, global-average-pool, and classify.
+
+        Args:
+            x: Input signal tensor of shape (batch, channels, timesteps).
+
+        Returns:
+            torch.Tensor: Class logits of shape (batch, num_classes).
+        """
         x = self.conv_blocks(x)  # (batch, channels, timesteps)
         x = x.mean(dim=2)  # global average pool over time -> (batch, channels)
         return self.classifier(x)
 
 
 def print_formatted_examples_timeseries(dataset, num_examples: int = 2) -> None:
+    """Print shape/label info for a few dataset examples.
+
+    Used by `--debug_first_batch` to visually confirm preprocessing before
+    committing to a full training run.
+
+    Args:
+        dataset: A `TimeSeriesDataset` (or compatible indexable dataset) to
+            sample from.
+        num_examples (int): Maximum number of examples to print. Defaults
+            to 2.
+    """
     print_banner("FORMATTED EXAMPLES")
     for i in range(min(num_examples, len(dataset))):
         example = dataset[i]
@@ -139,6 +228,18 @@ def print_formatted_examples_timeseries(dataset, num_examples: int = 2) -> None:
 
 @torch.no_grad()
 def evaluate(model, loader, device):
+    """Run the model over a dataloader and compute classification metrics.
+
+    Args:
+        model: The `FCN` model to evaluate. Left in eval mode during
+            inference and switched back to train mode before returning.
+        loader: A `DataLoader` yielding `signal`/`labels` batches.
+        device: Torch device to move batches to.
+
+    Returns:
+        dict: `loss` (mean cross-entropy), `accuracy`, `f1_macro`,
+        `precision`, and `recall` (macro-averaged).
+    """
     model.eval()
     all_preds, all_labels = [], []
     total_loss = 0.0
@@ -162,6 +263,14 @@ def evaluate(model, loader, device):
 
 
 def main():
+    """Run the full time-series classification pipeline: load, train, evaluate, record.
+
+    Parses CLI args, loads and normalizes the ECG dataset, either dumps
+    formatted debug examples and exits or trains the `FCN` model with a
+    plain PyTorch loop, evaluates the result, and writes a
+    `run_result.json` (no model checkpoint is saved for this from-scratch
+    baseline).
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Time-series classification (from-scratch FCN, ECG)")

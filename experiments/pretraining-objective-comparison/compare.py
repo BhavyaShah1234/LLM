@@ -21,6 +21,12 @@ from common.compare_runs import load_run_results, print_comparison_table
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for the three pretraining run output directories.
+
+    Returns:
+        argparse.ArgumentParser: Parser with `--clm_dir`, `--mlm_dir`, and
+        `--span_corruption_dir` options.
+    """
     p = argparse.ArgumentParser(description="Compare the three pretraining/ runs (one per architecture family).")
     p.add_argument("--clm_dir", type=str, default="./output/pretraining/clm", help="Output dir passed to clm.py's --output_dir.")
     p.add_argument("--mlm_dir", type=str, default="./output/pretraining/mlm", help="Output dir passed to mlm.py's --output_dir.")
@@ -29,6 +35,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    """Load the three pretraining objectives' run_result.json files and print a comparison table."""
     args = build_arg_parser().parse_args()
     run_dirs = {
         "clm (decoder-only)": args.clm_dir,

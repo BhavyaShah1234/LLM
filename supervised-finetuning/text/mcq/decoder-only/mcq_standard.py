@@ -42,6 +42,13 @@ INSTRUCTION = "Answer the following medical multiple choice question by selectin
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this training script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model/quantization, LoRA,
+            training hyperparameters, data sampling, output/checkpointing,
+            and seeding/debug flags.
+    """
     p = argparse.ArgumentParser(description="SFT a decoder-only model for medical MCQ (standard).")
 
     p.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B-Base", help="Base checkpoint. Default: Qwen/Qwen3-1.7B-Base.")
@@ -81,6 +88,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def format_question(row) -> str:
+    """Render a MedMCQA row's question and four options as a single prompt block.
+
+    Args:
+        row (dict): Dataset row with "Question", "Option_A".."Option_D" fields.
+
+    Returns:
+        str: Question text followed by an "A./B./C./D." option listing.
+    """
     return (
         f"{row['Question']}\n\n"
         f"A. {row['Option_A']}\n"
@@ -91,15 +106,50 @@ def format_question(row) -> str:
 
 
 class MCQDataset(Dataset):
+    """Tokenized medical-MCQ dataset with answer-only supervision.
+
+    Formats each row as ``### Instruction: ... ### Input: ... ### Response:
+    {A|B|C|D}`` and masks the prompt out of the loss, so loss is computed on
+    the answer-letter token(s) only.
+
+    Attributes:
+        rows (list): Raw dataset rows, each with "Question", "Option_A".."Option_D",
+            and "Label" fields.
+        tokenizer: Tokenizer used to encode prompt and full text.
+        max_length (int): Max sequence length used when tokenizing the full example.
+    """
+
     def __init__(self, rows, tokenizer, max_length: int):
+        """Initialize the dataset.
+
+        Args:
+            rows (list): Raw dataset rows, each with "Question", "Option_A".."Option_D",
+                and "Label" fields.
+            tokenizer: Tokenizer used to encode prompt and full text.
+            max_length (int): Max sequence length used when tokenizing the full example.
+        """
         self.rows = rows
         self.tokenizer = tokenizer
         self.max_length = max_length
 
     def __len__(self):
+        """Return the number of examples in the dataset.
+
+        Returns:
+            int: Number of rows.
+        """
         return len(self.rows)
 
     def __getitem__(self, idx):
+        """Build a tokenized, loss-masked training example with answer-only supervision.
+
+        Args:
+            idx (int): Index of the row to fetch.
+
+        Returns:
+            dict: ``input_ids``, ``attention_mask``, and ``labels`` (prompt
+                tokens masked with -100; only the answer letter kept).
+        """
         row = self.rows[idx]
         prompt = f"### Instruction:\n{INSTRUCTION}\n\n### Input:\n{format_question(row)}\n\n### Response:\n"
         full_text = prompt + row["Label"]
@@ -116,6 +166,11 @@ class MCQDataset(Dataset):
 
 
 def verify_dataset() -> None:
+    """Peek the dataset via streaming and assert the expected fields are present.
+
+    Not called by default in ``main`` (see the comment there) since it would
+    otherwise trigger a second load of the same dataset.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train", streaming=True)
     example = next(iter(peek))
@@ -128,6 +183,22 @@ def verify_dataset() -> None:
 
 
 def load_and_prepare_data(args, tokenizer):
+    """Load the train/dev splits and apply sample selection.
+
+    Uses the "dev" split for eval, not "test" -- confirmed empirically (see
+    the inline comment below) that araag2/MedMCQA's test split has
+    ``Label=None`` for every row.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses ``max_samples``,
+            ``sample_selection``, ``max_eval_samples``, ``max_length``, and ``seed``.
+        tokenizer: Tokenizer passed through to the constructed datasets.
+
+    Returns:
+        tuple: ``(train_dataset, eval_dataset, eval_rows)`` where the first two
+            are :class:`MCQDataset` instances and ``eval_rows`` is the raw
+            (untokenized) list of eval rows for later generation-based evaluation.
+    """
     print_banner("LOADING DATASET")
     train_raw = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train")
     # NOT split="test": confirmed empirically (while building
@@ -150,6 +221,18 @@ def load_and_prepare_data(args, tokenizer):
 
 
 def decode_example(example, index, tokenizer):
+    """Render a tokenized example back to text for ``--debug_first_batch`` inspection.
+
+    Args:
+        example (dict): Tokenized example with ``input_ids`` and ``labels``.
+        index (int): Position of this example in the batch being printed (unused
+            in the body but kept for a uniform ``decode_fn`` signature).
+        tokenizer: Tokenizer used to decode ``input_ids`` and the unmasked labels.
+
+    Returns:
+        str: Human-readable dump of the full formatted text and the answer
+            letter the loss is computed on.
+    """
     input_ids = example["input_ids"]
     labels = example["labels"]
     full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
@@ -159,6 +242,18 @@ def decode_example(example, index, tokenizer):
 
 
 def evaluate_model(model, tokenizer, eval_rows, args):
+    """Generate a short completion per eval row and score answer-letter accuracy.
+
+    Args:
+        model: Trained causal LM used for generation.
+        tokenizer: Tokenizer used to build prompts and decode generations.
+        eval_rows (list): Raw eval rows with "Question", "Option_A".."Option_D",
+            and "Label" fields.
+        args (argparse.Namespace): Parsed CLI args; uses ``max_length``.
+
+    Returns:
+        dict: ``{"accuracy": float, "f1_macro": float}``.
+    """
     print_banner("EVALUATION")
     model.eval()
     predictions, ground_truths = [], []
@@ -183,6 +278,7 @@ def evaluate_model(model, tokenizer, eval_rows, args):
 
 
 def main():
+    """Run the end-to-end MCQ standard pipeline: load, train, evaluate, save, record."""
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Medical MCQ SFT -- decoder-only, standard")

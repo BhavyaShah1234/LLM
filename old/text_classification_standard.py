@@ -31,6 +31,13 @@ warnings.filterwarnings("ignore")
 
 
 def parse_args():
+    """Parse command-line arguments for the standard text-classification fine-tuning run.
+
+    Returns:
+        argparse.Namespace: Parsed CLI arguments covering model choice,
+        quantization, LoRA, training hyperparameters, data limits, and
+        output/logging configuration.
+    """
     parser = argparse.ArgumentParser(description="Fine-tune Qwen models for text classification")
     
     # Model arguments
@@ -109,18 +116,53 @@ def parse_args():
 
 
 class TextClassificationDataset(Dataset):
-    """Custom dataset for text classification with proper loss masking"""
-    
+    """Torch dataset that formats SST-2 sentiment examples with loss masking.
+
+    Each item is rendered as an instruction/input/response prompt whose
+    response is the sentiment label; the prompt span is masked out of the
+    labels so loss is computed only on the label tokens.
+
+    Attributes:
+        data (List[Dict]): Formatted examples with `"sentence"` and `"label"` keys.
+        tokenizer: Tokenizer used to encode prompt/response text.
+        max_length (int): Maximum tokenized sequence length.
+        label_map (Dict): Mapping from integer class id to label text (e.g.
+            `{0: "negative", 1: "positive"}`).
+    """
+
     def __init__(self, data: List[Dict], tokenizer, max_length: int, label_map: Dict):
+        """Initialize the dataset.
+
+        Args:
+            data (List[Dict]): Formatted examples with `"sentence"` and
+                `"label"` keys.
+            tokenizer: Tokenizer used to encode prompt/response text.
+            max_length (int): Maximum tokenized sequence length.
+            label_map (Dict): Mapping from integer class id to label text.
+        """
         self.data = data
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.label_map = label_map
-        
+
     def __len__(self):
+        """Return the number of examples in the dataset.
+
+        Returns:
+            int: Number of examples.
+        """
         return len(self.data)
-    
+
     def __getitem__(self, idx):
+        """Format and tokenize one example, masking the prompt from the labels.
+
+        Args:
+            idx (int): Index of the example to fetch.
+
+        Returns:
+            dict: `{"input_ids": list[int], "attention_mask": list[int],
+            "labels": list[int]}` with prompt tokens set to `-100` in `labels`.
+        """
         item = self.data[idx]
         
         # Format prompt
@@ -151,7 +193,21 @@ class TextClassificationDataset(Dataset):
 
 
 def load_and_prepare_data(args):
-    """Load and preprocess the dataset"""
+    """Load, format, and split the GLUE SST-2 sentiment dataset.
+
+    Loads `Tohrumi/glue_sst2_10k`, maps integer labels to text, picks the
+    first available eval-like split (`validation`/`eval`/`test`, falling
+    back to a 90/10 split of train), and optionally truncates to
+    `args.max_samples`.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `args.max_samples`.
+
+    Returns:
+        tuple[list[dict], list[dict], dict]: `(train_data, test_data,
+        label_map)`, where each data list holds dicts with `"sentence"` and
+        `"label"` (text) keys, and `label_map` maps int id to label text.
+    """
     print("\n" + "="*80)
     print("LOADING DATASET")
     print("="*80)
@@ -198,7 +254,21 @@ def load_and_prepare_data(args):
 
 
 def setup_model_and_tokenizer(args):
-    """Initialize model and tokenizer with quantization and LoRA"""
+    """Load the tokenizer and quantized/LoRA-wrapped causal LM.
+
+    Configures 4-bit/8-bit/no quantization per `args.quantization`, enables
+    gradient checkpointing if requested, and wraps the model with LoRA if
+    `args.lora` is set.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `args.model`,
+            `args.quantization`, `args.mixed_precision`,
+            `args.gradient_checkpointing`, `args.lora`, `args.lora_r`,
+            `args.lora_alpha`, `args.lora_dropout`, `args.lora_target_modules`.
+
+    Returns:
+        tuple: `(model, tokenizer)`.
+    """
     print("\n" + "="*80)
     print("LOADING MODEL AND TOKENIZER")
     print("="*80)
@@ -271,7 +341,16 @@ def setup_model_and_tokenizer(args):
 
 
 def print_examples(train_dataset, tokenizer, num_examples=2):
-    """Print formatted examples"""
+    """Print a few formatted training examples for a sanity check.
+
+    Decodes the full input text and the label-only (non-masked) span for
+    each sampled example, and prints token-length stats.
+
+    Args:
+        train_dataset (TextClassificationDataset): Dataset to sample from.
+        tokenizer: Tokenizer used to decode token ids back to text.
+        num_examples (int): Number of examples to print. Defaults to 2.
+    """
     print("\n" + "="*80)
     print("FORMATTED EXAMPLES")
     print("="*80)
@@ -296,7 +375,23 @@ def print_examples(train_dataset, tokenizer, num_examples=2):
 
 
 def train_model(model, tokenizer, train_dataset, eval_dataset, args):
-    """Train the model"""
+    """Fine-tune the model with `Trainer` and save the result.
+
+    Builds `TrainingArguments` from `args`, trains with a seq2seq-style
+    padding collator, then saves the model and tokenizer to `args.output_dir`.
+
+    Args:
+        model: Model to fine-tune.
+        tokenizer: Tokenizer paired with `model`, used by the data collator
+            and saved alongside the model.
+        train_dataset (TextClassificationDataset): Training dataset.
+        eval_dataset (TextClassificationDataset): Evaluation dataset.
+        args (argparse.Namespace): Parsed CLI args supplying training
+            hyperparameters and `args.output_dir`.
+
+    Returns:
+        Trainer: The trainer instance after training completes.
+    """
     print("\n" + "="*80)
     print("TRAINING")
     print("="*80)
@@ -361,7 +456,27 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, args):
 
 
 def evaluate_model(model, tokenizer, test_data, label_map, args):
-    """Evaluate model on test set"""
+    """Generate predictions on the test set and compute classification metrics.
+
+    Runs short greedy generation per example, extracts the positive/negative
+    prediction from the generated text, computes accuracy/F1/precision/
+    recall/AUROC, and writes the results to `evaluation_results.json` in
+    `args.output_dir`.
+
+    Args:
+        model: Fine-tuned model to evaluate (used in `model.generate`).
+        tokenizer: Tokenizer used to build prompts and decode outputs.
+        test_data (list[dict]): Held-out examples with `"sentence"` and
+            `"label"` (text) keys.
+        label_map (dict): Mapping from integer class id to label text, used
+            to build the reverse map back to integer ground truth.
+        args (argparse.Namespace): Parsed CLI args; uses `args.max_length`
+            and `args.output_dir`.
+
+    Returns:
+        dict: Metrics dict (accuracy, f1_macro, f1_weighted, precision,
+        recall, auroc, num_test_samples) — the same dict written to disk.
+    """
     print("\n" + "="*80)
     print("EVALUATION")
     print("="*80)
@@ -459,8 +574,14 @@ def evaluate_model(model, tokenizer, test_data, label_map, args):
 
 
 def main():
+    """Run the end-to-end standard text-classification fine-tuning pipeline.
+
+    Parses args, seeds RNGs, loads data and model, builds datasets, prints
+    sample formatting, optionally exits early in debug mode, then trains
+    and evaluates the model.
+    """
     args = parse_args()
-    
+
     # Set seed
     random.seed(args.seed)
     np.random.seed(args.seed)

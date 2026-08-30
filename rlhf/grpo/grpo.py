@@ -57,6 +57,14 @@ ANSWER_LETTER_RE = re.compile(r"\b([A-D])\b")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for this script's model/LoRA/GRPO/training options.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model/quantization, LoRA,
+        GRPO sampling (`--num_generations`, `--max_completion_length`,
+        `--temperature`, `--beta`), training hyperparameters, data
+        selection, output/checkpointing, and `--seed`/`--debug_first_batch`.
+    """
     p = argparse.ArgumentParser(description="Train a decoder-only model with GRPO against a verifiable MCQ-correctness reward.")
 
     p.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B", help="SFT'd/instruction-tuned checkpoint to train (local path or HF Hub id) -- NOT a raw base model, see module docstring. Default: Qwen/Qwen3-1.7B (vendor instruct).")
@@ -97,6 +105,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def format_question(row) -> str:
+    """Render a MedMCQA row's question and four options as plain text.
+
+    Args:
+        row: A dataset row with `Question`, `Option_A`, `Option_B`,
+            `Option_C`, and `Option_D` fields.
+
+    Returns:
+        str: The question followed by its four lettered options.
+    """
     return (
         f"{row['Question']}\n\n"
         f"A. {row['Option_A']}\n"
@@ -107,10 +124,19 @@ def format_question(row) -> str:
 
 
 def build_prompt(row) -> str:
+    """Build the instruction-tuning-style prompt used for this row's MCQ.
+
+    Args:
+        row: A dataset row with the fields `format_question` expects.
+
+    Returns:
+        str: The full "### Instruction / ### Input / ### Response" prompt.
+    """
     return f"### Instruction:\n{INSTRUCTION}\n\n### Input:\n{format_question(row)}\n\n### Response:\n"
 
 
 def verify_dataset() -> None:
+    """Stream-peek one row of the dataset and assert the expected MCQ fields are present."""
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train", streaming=True)
     example = next(iter(peek))
@@ -123,6 +149,16 @@ def verify_dataset() -> None:
 
 
 def load_and_prepare_data(args):
+    """Load the train/dev splits, subsample them, and map rows to GRPO's `prompt`/`answer` schema.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `max_samples`,
+            `sample_selection`, `max_eval_samples`, and `seed`.
+
+    Returns:
+        tuple: `(train_dataset, eval_dataset)`, each with `prompt` (str) and
+        `answer` (ground-truth letter) columns.
+    """
     print_banner("LOADING DATASET")
     train_raw = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train")
     # NOT split="test": confirmed empirically that araag2/MedMCQA's test split has Label=None
@@ -134,6 +170,7 @@ def load_and_prepare_data(args):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def to_prompt_dataset(examples):
+        """Map a batch of raw MedMCQA rows to GRPO's `prompt`/`answer` columns."""
         return {
             "prompt": [build_prompt({"Question": q, "Option_A": a, "Option_B": b, "Option_C": c, "Option_D": d}) for q, a, b, c, d in zip(examples["Question"], examples["Option_A"], examples["Option_B"], examples["Option_C"], examples["Option_D"])],
             "answer": examples["Label"],
@@ -151,7 +188,18 @@ def load_and_prepare_data(args):
 def mcq_correctness_reward(prompts, completions, answer, **kwargs) -> list:
     """Verifiable, rule-based reward: 1.0 if the completion's first standalone
     A/B/C/D letter matches the ground-truth answer, else 0.0. No learned
-    reward model, no human labels needed at training time -- this is RLVR."""
+    reward model, no human labels needed at training time -- this is RLVR.
+
+    Args:
+        prompts: The prompts the completions were generated from. Unused --
+            the reward only depends on `completions` and `answer`.
+        completions (list[str]): Generated completion text, one per prompt.
+        answer (list[str]): Ground-truth answer letters, one per prompt.
+        **kwargs: Additional fields GRPOTrainer passes to reward functions; unused.
+
+    Returns:
+        list[float]: 1.0/0.0 reward per completion, matching `completions`' order.
+    """
     rewards = []
     for completion, correct_letter in zip(completions, answer):
         match = ANSWER_LETTER_RE.search(completion.strip().upper())
@@ -161,6 +209,7 @@ def mcq_correctness_reward(prompts, completions, answer, **kwargs) -> list:
 
 
 def main():
+    """Run the GRPO training pipeline: load data, build the trainer, train, evaluate, save, and record results."""
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "GRPO -- decoder-only, verifiable MCQ-correctness reward (RLVR)")

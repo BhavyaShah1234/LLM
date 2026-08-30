@@ -45,6 +45,13 @@ ARCHITECTURE = "encoder-only"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for the encoder-only classification run.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model/precision, optimization,
+            data-selection, output/checkpointing, and seed/debug flags for
+            this script.
+    """
     p = argparse.ArgumentParser(description="SFT an encoder-only model for text classification (classification head).")
 
     p.add_argument("--model", type=str, default="answerdotai/ModernBERT-base", help="Encoder-only base checkpoint. Default: answerdotai/ModernBERT-base (fp16 ~1.2GB).")
@@ -75,6 +82,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset() -> None:
+    """Peek the dataset (streaming) and assert the expected fields exist.
+
+    Raises:
+        AssertionError: If `sentence` or `label` is missing from the first
+            streamed example.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -87,6 +100,20 @@ def verify_dataset() -> None:
 
 
 def load_and_prepare_data(args, tokenizer):
+    """Load the train/eval splits and tokenize them for a classification head.
+
+    Tokenizes the raw sentence and renames the `label` column to `labels`
+    (the name `Trainer`/`AutoModelForSequenceClassification` expect).
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `max_samples`,
+            `sample_selection`, `max_eval_samples`, `seed`, and `max_length`.
+        tokenizer: Tokenizer used to encode the sentences.
+
+    Returns:
+        tuple: `(train_dataset, eval_dataset)`, HF `Dataset` objects with
+            `input_ids`, `attention_mask`, and `labels` columns.
+    """
     print_banner("LOADING DATASET")
     train_raw = load_dataset(DATASET_NAME, split="train")
     eval_raw = load_dataset(DATASET_NAME, split="eval")
@@ -95,6 +122,15 @@ def load_and_prepare_data(args, tokenizer):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def tokenize_fn(examples):
+        """Tokenize a batch of raw sentences.
+
+        Args:
+            examples (dict): Batched raw rows with a `sentence` column (as
+                produced by `Dataset.map(batched=True)`).
+
+        Returns:
+            dict: Tokenized `input_ids`/`attention_mask` for the sentences.
+        """
         return tokenizer(examples["sentence"], truncation=True, max_length=args.max_length)
 
     train_dataset = train_raw.map(tokenize_fn, batched=True, desc="Tokenizing (train)")
@@ -109,6 +145,13 @@ def load_and_prepare_data(args, tokenizer):
 
 
 def print_formatted_examples_classification(dataset, tokenizer, num_examples=2):
+    """Print a few tokenized input/label pairs for debugging.
+
+    Args:
+        dataset: Tokenized HF `Dataset` with `input_ids` and `labels` columns.
+        tokenizer: Tokenizer used to decode the token ids back to text.
+        num_examples (int): Number of examples to print. Default: 2.
+    """
     print_banner("FORMATTED EXAMPLES")
     for i in range(min(num_examples, len(dataset))):
         example = dataset[i]
@@ -119,6 +162,16 @@ def print_formatted_examples_classification(dataset, tokenizer, num_examples=2):
 
 
 def compute_metrics(eval_pred):
+    """Compute classification metrics from a `Trainer` eval prediction.
+
+    Args:
+        eval_pred: `(logits, labels)` tuple from `Trainer`, where `logits`
+            has shape `(num_examples, 2)`.
+
+    Returns:
+        dict: Accuracy, macro/weighted F1, precision, recall, and AUROC
+            (`nan` if undefined, e.g. only one class present in `labels`).
+    """
     logits, labels = eval_pred
     predictions = np.argmax(logits, axis=-1)
     accuracy = accuracy_score(labels, predictions)
@@ -142,6 +195,12 @@ def compute_metrics(eval_pred):
 
 
 def main():
+    """Run the full encoder-only classification-head SFT pipeline end to end.
+
+    Parses CLI args, loads the tokenizer/dataset/model, either prints a debug
+    batch and exits or trains with `Trainer`, evaluates, saves the model, and
+    writes a `run_result.json`.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Text classification SFT -- encoder-only (classification head)")

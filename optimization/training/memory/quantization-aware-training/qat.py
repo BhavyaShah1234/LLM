@@ -64,6 +64,13 @@ ARCHITECTURE = "decoder-only"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this benchmark.
+
+    Returns:
+        argparse.ArgumentParser: Parser with all benchmark options (model,
+        quantization bit-width, dataset sizing, training hyperparameters,
+        seed, output dir, logging/debug flags) registered.
+    """
     p = argparse.ArgumentParser(description="Quantization-Aware Training benchmark: fine-tune a pretrained checkpoint through simulated weight quantization.")
     p.add_argument("--model", type=str, default="./output/pretraining/clm", help="Pretrained checkpoint to start from (local dir or HF Hub id). Default: this project's own from-scratch CLM checkpoint.")
     p.add_argument("--num_bits", type=int, default=8, choices=[4, 8], help="Simulated quantization bit-width for weights. Default: 8.")
@@ -98,6 +105,16 @@ class FakeQuantSTE(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, weight, num_bits):
+        """Round `weight` to `num_bits` symmetric levels and dequantize back to float.
+
+        Args:
+            ctx (torch.autograd.function.FunctionCtx): Autograd context (unused; no tensors are saved since backward is a straight-through pass).
+            weight (torch.Tensor): Weight tensor to fake-quantize.
+            num_bits (int): Bit-width to simulate (per-tensor symmetric scale derived from `weight`'s max absolute value).
+
+        Returns:
+            torch.Tensor: `weight`, rounded to `num_bits` levels and rescaled back to the original range.
+        """
         qmax = 2 ** (num_bits - 1) - 1
         qmin = -(2 ** (num_bits - 1))
         scale = weight.detach().abs().max().clamp(min=1e-8) / qmax
@@ -106,17 +123,50 @@ class FakeQuantSTE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Pass the gradient through unchanged (straight-through estimator).
+
+        Args:
+            ctx (torch.autograd.function.FunctionCtx): Autograd context (unused).
+            grad_output (torch.Tensor): Gradient w.r.t. this function's output.
+
+        Returns:
+            tuple[torch.Tensor, None]: `(grad_output, None)` -- the gradient
+            passed straight through for `weight`, and `None` for the
+            non-differentiable `num_bits` argument.
+        """
         return grad_output, None
 
 
 class FakeQuantLinear(nn.Module):
+    """Drop-in replacement for `nn.Linear` that fake-quantizes its weight on every forward pass.
+
+    Attributes:
+        weight (torch.nn.Parameter): The original layer's weight Parameter (shared, not copied, to preserve weight tying).
+        bias (torch.nn.Parameter): The original layer's bias Parameter.
+        num_bits (int): Simulated quantization bit-width applied to `weight` each forward pass.
+    """
+
     def __init__(self, orig: nn.Linear, num_bits: int):
+        """Wrap an existing `nn.Linear` layer for fake quantization.
+
+        Args:
+            orig (nn.Linear): Layer to wrap; its weight/bias Parameters are reused directly (not cloned), which preserves weight tying (e.g. lm_head <-> embedding).
+            num_bits (int): Simulated quantization bit-width.
+        """
         super().__init__()
         self.weight = orig.weight  # same Parameter object -- preserves weight tying (lm_head <-> wte)
         self.bias = orig.bias
         self.num_bits = num_bits
 
     def forward(self, x):
+        """Apply fake-quantized weights to a standard linear transform.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: `F.linear(x, fake_quantized_weight, self.bias)`.
+        """
         w = FakeQuantSTE.apply(self.weight, self.num_bits)
         return F.linear(x, w, self.bias)
 
@@ -125,9 +175,21 @@ class FakeQuantConv1D(nn.Module):
     """Fake-quantized replacement for transformers.pytorch_utils.Conv1D --
     GPT2's attention/MLP projections, weight shape (in_features, out_features)
     (transposed relative to nn.Linear), forward via torch.addmm.
+
+    Attributes:
+        weight (torch.nn.Parameter): The original layer's weight Parameter (shared, not copied).
+        bias (torch.nn.Parameter): The original layer's bias Parameter.
+        nf (int): Output feature count, taken from the original `Conv1D` (needed to reshape the `addmm` output).
+        num_bits (int): Simulated quantization bit-width applied to `weight` each forward pass.
     """
 
     def __init__(self, orig: Conv1D, num_bits: int):
+        """Wrap an existing `Conv1D` layer for fake quantization.
+
+        Args:
+            orig (Conv1D): Layer to wrap; its weight/bias Parameters and `nf` are reused directly (not cloned).
+            num_bits (int): Simulated quantization bit-width.
+        """
         super().__init__()
         self.weight = orig.weight
         self.bias = orig.bias
@@ -135,6 +197,14 @@ class FakeQuantConv1D(nn.Module):
         self.num_bits = num_bits
 
     def forward(self, x):
+        """Apply fake-quantized weights to `Conv1D`'s `addmm`-based transform.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape `(..., in_features)`.
+
+        Returns:
+            torch.Tensor: Output tensor of shape `(..., self.nf)`.
+        """
         w = FakeQuantSTE.apply(self.weight, self.num_bits)
         size_out = x.size()[:-1] + (self.nf,)
         x = torch.addmm(self.bias, x.view(-1, x.size(-1)), w)
@@ -144,6 +214,13 @@ class FakeQuantConv1D(nn.Module):
 def apply_fake_quant(model: nn.Module, num_bits: int) -> int:
     """In-place: replace every nn.Linear / Conv1D child with a fake-quant
     wrapper around the SAME weight Parameter. Returns the count replaced.
+
+    Args:
+        model (nn.Module): Model to mutate in place.
+        num_bits (int): Simulated quantization bit-width passed to each wrapper.
+
+    Returns:
+        int: Number of `nn.Linear`/`Conv1D` child modules replaced.
     """
     replaced = 0
     modules = list(model.modules())  # materialize first: safe to mutate children while iterating this list
@@ -159,6 +236,22 @@ def apply_fake_quant(model: nn.Module, num_bits: int) -> int:
 
 
 def tokenize_and_pack(dataset, tokenizer, block_size: int, desc: str):
+    """Tokenize raw text rows and pack them into fixed-length CLM training blocks.
+
+    Appends the tokenizer's EOS token to each text, tokenizes, concatenates
+    all tokens, then chunks into contiguous `block_size`-token blocks
+    (dropping any remainder shorter than `block_size`), with `labels` set
+    equal to `input_ids`.
+
+    Args:
+        dataset (datasets.Dataset): Raw dataset with a `"text"` column.
+        tokenizer (transformers.PreTrainedTokenizerBase): Tokenizer used to encode text and supply the EOS token.
+        block_size (int): Length of each packed training block.
+        desc (str): Short label used in the `datasets.Dataset.map` progress-bar description.
+
+    Returns:
+        datasets.Dataset: Packed dataset with `input_ids` and `labels` columns of length `block_size` each.
+    """
     def tokenize_fn(examples):
         texts_with_eos = [t + tokenizer.eos_token for t in examples["text"]]
         return tokenizer(texts_with_eos)
@@ -176,6 +269,23 @@ def tokenize_and_pack(dataset, tokenizer, block_size: int, desc: str):
 
 
 def evaluate_perplexity(model, eval_dataset, data_collator, batch_size, device):
+    """Compute token-weighted average loss and perplexity over an eval set.
+
+    Temporarily switches `model` to eval mode (restored to train mode
+    before returning) and disables gradients while iterating.
+
+    Args:
+        model (transformers.PreTrainedModel): Model to evaluate, currently possibly fake-quantized.
+        eval_dataset (datasets.Dataset): Packed eval dataset from `tokenize_and_pack`.
+        data_collator (transformers.DataCollatorForLanguageModeling): Collator used to batch examples.
+        batch_size (int): Evaluation batch size.
+        device (str): Torch device to run evaluation on.
+
+    Returns:
+        tuple[float, float]: `(avg_loss, perplexity)` -- the token-weighted
+        mean cross-entropy loss, and `exp(avg_loss)` (or `inf` if `avg_loss`
+        is large enough that `exp` would overflow).
+    """
     model.eval()
     loader = torch.utils.data.DataLoader(eval_dataset, batch_size=batch_size, collate_fn=data_collator)
     total_loss, total_tokens = 0.0, 0
@@ -193,6 +303,15 @@ def evaluate_perplexity(model, eval_dataset, data_collator, batch_size, device):
 
 
 def main():
+    """Run the QAT benchmark: baseline eval, fake-quantize, adapt, re-eval, and write a `run_result.json`.
+
+    Parses CLI args, loads the model/tokenizer/dataset, evaluates
+    full-precision baseline perplexity, applies fake quantization (or
+    skips it under `--skip_quantization`), optionally exits early on
+    `--debug_first_batch`, otherwise runs the QAT adaptation training loop,
+    re-evaluates perplexity, and records the comparison via
+    `common.run_results.write_run_result`.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Quantization-Aware Training (QAT) benchmark")

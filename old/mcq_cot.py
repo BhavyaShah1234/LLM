@@ -22,6 +22,12 @@ import warnings
 warnings.filterwarnings("ignore")
 
 def parse_args():
+    """Parse CLI arguments controlling model choice, quantization/LoRA, and training hyperparameters.
+
+    Returns:
+        argparse.Namespace: parsed arguments consumed by `load_and_prepare_data`,
+        `setup_model_and_tokenizer`, `train_and_evaluate`, and `main`.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True,
                         choices=["Qwen/Qwen3-4B-Base", "Qwen/Qwen3-4B", 
@@ -54,13 +60,38 @@ def parse_args():
     return parser.parse_args()
 
 class MCQCoTDataset(Dataset):
+    """Torch dataset that formats medical MCQ question/options/reasoning/answer examples into a CoT prompt, masking the prompt out of the loss.
+
+    Attributes:
+        data (list): list of `{"question", "options", "reasoning", "answer"}` examples.
+        tokenizer: tokenizer used to encode prompt and full (prompt + CoT + answer) text.
+        max_length (int): max token length the full sequence is truncated to.
+    """
     def __init__(self, data, tokenizer, max_length):
+        """Store the examples, tokenizer, and max length used at `__getitem__` time.
+
+        Args:
+            data (list): list of `{"question", "options", "reasoning", "answer"}` examples.
+            tokenizer: tokenizer with a callable `__call__` interface.
+            max_length (int): max sequence length passed to the tokenizer for the full text.
+        """
         self.data = data
         self.tokenizer = tokenizer
         self.max_length = max_length
     def __len__(self):
+        """Return the number of examples in the dataset."""
         return len(self.data)
     def __getitem__(self, idx):
+        """Tokenize example `idx` into a `<think>` CoT + answer-letter prompt, masking the prompt in labels with -100.
+
+        Args:
+            idx (int): index of the example to fetch.
+
+        Returns:
+            dict: `input_ids`, `attention_mask`, and `labels` lists for the example (not yet
+            tensors — collation happens in `DataCollatorForSeq2Seq`), with label positions
+            covering the prompt set to -100 so they're excluded from the loss.
+        """
         item = self.data[idx]
         instruction = "Answer the medical question. Think through your reasoning step by step."
         prompt = f"### Instruction:\n{instruction}\n\n### Input:\n{item['question']}\n\n{item['options']}\n\n### Response:\n"
@@ -74,6 +105,16 @@ class MCQCoTDataset(Dataset):
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 def load_and_prepare_data(args):
+    """Load the medmcqa-cot dataset, extract the answer letter and reasoning from each response, and build train/test splits.
+
+    Args:
+        args (argparse.Namespace): parsed CLI args; uses `max_samples` to optionally cap the
+            train/test set sizes.
+
+    Returns:
+        tuple[list, list]: `(train_data, test_data)` lists of
+        `{"question", "options", "reasoning", "answer"}` dicts.
+    """
     print("\nLoading dataset: HPAI-BSC/medmcqa-cot-llama31 (WITH CoT)")
     dataset = load_dataset("HPAI-BSC/medmcqa-cot-llama31")
     def format_example(ex):
@@ -105,6 +146,15 @@ def load_and_prepare_data(args):
     return train_data, test_data
 
 def setup_model_and_tokenizer(args):
+    """Load the tokenizer and base model, applying quantization, gradient checkpointing, and LoRA per args.
+
+    Args:
+        args (argparse.Namespace): parsed CLI args controlling model name, quantization,
+            mixed precision, gradient checkpointing, and LoRA settings.
+
+    Returns:
+        tuple: `(model, tokenizer)` ready for training.
+    """
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -124,6 +174,21 @@ def setup_model_and_tokenizer(args):
     return model, tokenizer
 
 def train_and_evaluate(model, tokenizer, train_data, test_data, args):
+    """Fine-tune the model on the CoT MCQ training set, then generate on the test set and score accuracy/F1/CoT usage.
+
+    Trains via `Trainer`, saves the model and tokenizer to `args.output_dir`, then runs
+    greedy generation over `test_data` to extract the predicted answer letter and whether
+    a `<think>` block was produced, and writes `evaluation_results.json` with the metrics.
+
+    Args:
+        model: causal LM to fine-tune and evaluate.
+        tokenizer: tokenizer paired with `model`.
+        train_data (list): training examples as `{"question", "options", "reasoning", "answer"}` dicts.
+        test_data (list): held-out examples in the same format, used for both eval-during-training
+            (first 50) and post-training generation-based evaluation (all of them).
+        args (argparse.Namespace): parsed CLI args controlling training hyperparameters and
+            `output_dir`.
+    """
     train_dataset = MCQCoTDataset(train_data, tokenizer, args.max_length)
     eval_dataset = MCQCoTDataset(test_data[:50], tokenizer, args.max_length)
     training_args = TrainingArguments(output_dir=args.output_dir, num_train_epochs=args.epochs, per_device_train_batch_size=args.batch_size, per_device_eval_batch_size=args.eval_batch_size, gradient_accumulation_steps=args.gradient_accumulation_steps, learning_rate=args.learning_rate, warmup_steps=args.warmup_steps, weight_decay=args.weight_decay, logging_steps=args.logging_steps, eval_steps=args.eval_steps, save_steps=args.save_steps, save_total_limit=args.save_total_limit, fp16=(args.mixed_precision=="fp16"), bf16=(args.mixed_precision=="bf16"), optim=args.optim, gradient_checkpointing=args.gradient_checkpointing, eval_strategy="steps", save_strategy="steps", load_best_model_at_end=True, report_to=["none"], seed=args.seed)
@@ -162,6 +227,7 @@ def train_and_evaluate(model, tokenizer, train_data, test_data, args):
         json.dump({"accuracy": float(accuracy), "f1_macro": float(f1), "cot_enabled": True, "cot_usage_rate": float(cot_rate)}, f, indent=2)
 
 def main():
+    """Parse args, load data and model, and run the MCQ-with-CoT training-and-evaluation pipeline end to end."""
     args = parse_args()
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     print(f"\n{'='*80}\nMCQ With CoT\n{'='*80}")

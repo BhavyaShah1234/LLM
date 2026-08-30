@@ -37,6 +37,12 @@ ARCHITECTURE = "decoder-only"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this benchmark.
+
+    Returns:
+        argparse.ArgumentParser: Parser with all benchmark options (model,
+        output dir, seed, debug flag) registered.
+    """
     p = argparse.ArgumentParser(description="Benchmark checkpoint disk size and load time across save formats.")
     p.add_argument("--model", type=str, default="./output/pretraining/clm", help="Model checkpoint to re-save in different formats. Default: this project's own from-scratch CLM checkpoint.")
     p.add_argument("--output_dir", type=str, default="./output/optimization/checkpoint_compression_benchmark", help="Where to write the resaved checkpoints and run_result.json.")
@@ -46,6 +52,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def dir_size_bytes(path: str) -> int:
+    """Sum the real on-disk size of every file under a directory, recursively.
+
+    Args:
+        path (str): Directory to walk.
+
+    Returns:
+        int: Total size in bytes of all files under `path`.
+    """
     total = 0
     for root, _, files in os.walk(path):
         for f in files:
@@ -54,6 +68,18 @@ def dir_size_bytes(path: str) -> int:
 
 
 def save_and_time(model, tokenizer, output_dir: str, dtype: torch.dtype):
+    """Cast a model to `dtype`, save it (plus the tokenizer) to disk, and time the save.
+
+    Args:
+        model (transformers.PreTrainedModel): Model to cast and save.
+        tokenizer (transformers.PreTrainedTokenizerBase): Tokenizer saved alongside the model.
+        output_dir (str): Directory to save into (created if missing).
+        dtype (torch.dtype): Dtype to cast the model to before saving.
+
+    Returns:
+        tuple[float, int]: `(save_seconds, dir_size_bytes)` -- wall-clock
+        save time and the real on-disk size of everything written to `output_dir`.
+    """
     os.makedirs(output_dir, exist_ok=True)
     model_cast = model.to(dtype)
     start = time.time()
@@ -64,6 +90,16 @@ def save_and_time(model, tokenizer, output_dir: str, dtype: torch.dtype):
 
 
 def gzip_compress_and_time(src_path: str, dst_path: str):
+    """Gzip-compress a file and time the operation.
+
+    Args:
+        src_path (str): Path of the file to compress.
+        dst_path (str): Path to write the gzip-compressed output to.
+
+    Returns:
+        tuple[float, int]: `(compress_seconds, compressed_bytes)` -- wall-clock
+        compression time and the resulting file's size in bytes.
+    """
     start = time.time()
     with open(src_path, "rb") as f_in, gzip.open(dst_path, "wb", compresslevel=6) as f_out:
         shutil.copyfileobj(f_in, f_out)
@@ -72,6 +108,15 @@ def gzip_compress_and_time(src_path: str, dst_path: str):
 
 
 def gzip_decompress_and_time(src_path: str, dst_path: str):
+    """Gzip-decompress a file and time the operation.
+
+    Args:
+        src_path (str): Path of the gzip-compressed file to decompress.
+        dst_path (str): Path to write the decompressed output to.
+
+    Returns:
+        float: Wall-clock decompression time in seconds.
+    """
     start = time.time()
     with gzip.open(src_path, "rb") as f_in, open(dst_path, "wb") as f_out:
         shutil.copyfileobj(f_in, f_out)
@@ -80,6 +125,17 @@ def gzip_decompress_and_time(src_path: str, dst_path: str):
 
 
 def find_weights_file(directory: str) -> str:
+    """Locate a saved checkpoint's weights file within a directory.
+
+    Args:
+        directory (str): Directory to search for `model.safetensors` or `pytorch_model.bin`.
+
+    Returns:
+        str: Full path to the weights file found.
+
+    Raises:
+        FileNotFoundError: If neither `model.safetensors` nor `pytorch_model.bin` exists in `directory`.
+    """
     for name in ("model.safetensors", "pytorch_model.bin"):
         candidate = os.path.join(directory, name)
         if os.path.exists(candidate):
@@ -88,6 +144,15 @@ def find_weights_file(directory: str) -> str:
 
 
 def main():
+    """Run the fp32/bf16/gzip(bf16) checkpoint benchmark and write a `run_result.json`.
+
+    Parses CLI args, loads the base checkpoint, saves it as fp32
+    safetensors (exiting early if `--debug_first_batch` is set), then also
+    as bf16 safetensors and a gzip-compressed copy of the bf16 weights
+    file, measures real save/load/(de)compress times and on-disk byte
+    sizes for each variant, prints a summary, and records the comparison
+    via `common.run_results.write_run_result`.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Checkpoint compression benchmark")

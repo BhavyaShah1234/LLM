@@ -82,7 +82,11 @@ SCRIPTS = [
 COMMON_ARGS = "--epochs 5 --max_samples 100 --logging_steps 5 --eval_steps 25 --save_steps 1000"
 
 def cleanup_gpu_memory():
-    """Clean up GPU memory between tests."""
+    """Clean up GPU memory between tests.
+
+    Empties the CUDA cache and IPC handles (if torch/CUDA are available) and
+    forces a Python garbage-collection pass.
+    """
     if TORCH_AVAILABLE:
         try:
             import torch
@@ -96,7 +100,21 @@ def cleanup_gpu_memory():
     gc.collect()
 
 def run_test(script_info, config):
-    """Run a single test with given configuration."""
+    """Run a single fine-tuning script as a subprocess with a given config.
+
+    Builds the CLI command for `script_info["script"]`, executes it with a
+    10-minute timeout, and classifies the outcome as SUCCESS/OOM/FAILED/TIMEOUT/ERROR.
+
+    Args:
+        script_info (dict): Entry from `SCRIPTS` with keys `"script"` (filename),
+            `"model"` (HF model id), and `"category"` (task category, e.g. `"vqa"`).
+        config (dict): Entry from `CONFIGS`/`VQA_CONFIGS` with keys `"name"`,
+            `"args"` (extra CLI flags), and `"expected"` (expected outcome label).
+
+    Returns:
+        dict | None: A result record with status/timing/output fields, or `None`
+        if `config` is a non-VQA config being skipped for a VQA script.
+    """
     script = script_info["script"]
     model = script_info["model"]
     category = script_info["category"]
@@ -186,7 +204,20 @@ def run_test(script_info, config):
     return result
 
 def extract_metrics(output, output_dir):
-    """Extract loss and metrics from training output."""
+    """Extract loss and evaluation metrics from a script's captured output.
+
+    Scans stdout/stderr text line-by-line for `'loss':`/`"loss":` markers and
+    inline JSON eval dicts, and additionally reads `evaluation_results.json`
+    from `output_dir` if the script wrote one.
+
+    Args:
+        output (str): Combined stdout+stderr text from the subprocess run.
+        output_dir (str): Directory the script was told to write outputs to.
+
+    Returns:
+        dict: `{"train_loss_epochs": list[float], "eval_metrics": list[dict],
+        "final_eval": dict (optional)}`.
+    """
     metrics = {
         "train_loss_epochs": [],
         "eval_metrics": []
@@ -228,7 +259,12 @@ def extract_metrics(output, output_dir):
     return metrics
 
 def main():
-    """Run all tests and compile results."""
+    """Run every script in `SCRIPTS` against every applicable config.
+
+    Cleans GPU memory before/after each run, writes incremental results after
+    each test to `test_results_incremental.json`, then writes final
+    timestamped JSON results and a markdown summary via `generate_summary`.
+    """
     print("="*80)
     print("QWEN MODEL TESTING SUITE")
     print("="*80)
@@ -280,7 +316,18 @@ def main():
     print(f"{'='*80}\n")
 
 def generate_summary(results, timestamp):
-    """Generate a markdown summary of test results."""
+    """Write a markdown report summarizing a batch of test results.
+
+    Computes success/OOM/failed/timeout counts overall, broken down by
+    configuration and by task category, lists per-test details (status,
+    timing, loss trend, final eval metrics), and appends a recommendations
+    section (best config, OOM-prone configs, training viability, next steps).
+
+    Args:
+        results (list[dict]): Result records produced by `run_test`.
+        timestamp (str): Timestamp string (e.g. `"20260101_120000"`) used to
+            name the output file `test_summary_{timestamp}.md`.
+    """
     summary_file = f"test_summary_{timestamp}.md"
     
     with open(summary_file, "w") as f:

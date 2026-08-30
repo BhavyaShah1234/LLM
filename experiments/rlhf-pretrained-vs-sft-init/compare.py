@@ -30,6 +30,11 @@ from common.compare_runs import load_run_results, print_comparison_table
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for the two GRPO run output directories.
+
+    Returns:
+        argparse.ArgumentParser: Parser with `--instruct_dir` and `--pretrained_dir` options.
+    """
     p = argparse.ArgumentParser(description="Compare GRPO starting from an instruction-tuned vs raw pretrained checkpoint.")
     p.add_argument("--instruct_dir", type=str, default="./output/rlhf/grpo")
     p.add_argument("--pretrained_dir", type=str, default="./output/rlhf/grpo-pretrained-init")
@@ -37,6 +42,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _load(run_dir: str, label: str) -> dict:
+    """Load a single run's run_result.json, raising a helpful error if it's missing.
+
+    Args:
+        run_dir (str): Directory the run wrote its `run_result.json` into.
+        label (str): Human-readable name for this run, used in the error message.
+
+    Returns:
+        dict: The parsed run result for this run.
+
+    Raises:
+        FileNotFoundError: If `run_dir/run_result.json` doesn't exist.
+    """
     path = os.path.join(run_dir, "run_result.json")
     if not os.path.exists(path):
         raise FileNotFoundError(
@@ -47,6 +64,7 @@ def _load(run_dir: str, label: str) -> dict:
 
 
 def main():
+    """Load both GRPO runs and print the comparison table plus a detailed reward-hacking analysis note."""
     args = build_arg_parser().parse_args()
     instruct = _load(args.instruct_dir, "instruct-init")
     pretrained = _load(args.pretrained_dir, "pretrained-init")

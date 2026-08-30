@@ -49,6 +49,13 @@ INSTRUCTION = "Answer the following medical multiple choice question by selectin
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for this script's model/adapter/eval options.
+
+    Returns:
+        argparse.ArgumentParser: Parser with `--base_model`, `--adapter_dir`,
+        `--max_length`, `--max_eval_samples`, `--seed`, `--output_dir`, and
+        `--debug_first_batch` options.
+    """
     p = argparse.ArgumentParser(description="Evaluate a bf16-trained LoRA adapter with the base model re-loaded in 4-bit.")
     p.add_argument("--base_model", type=str, default="Qwen/Qwen3-1.7B-Base", help="Base checkpoint the adapter was trained against. Default: Qwen/Qwen3-1.7B-Base (must match --adapter_dir's training run).")
     p.add_argument("--adapter_dir", type=str, default="./output/experiments/quantized-training-vs-quantized-inference/train-bf16", help="Adapter trained WITHOUT quantization (mcq_standard.py --lora --quantization no output). Default: this experiment's own bf16-trained run.")
@@ -61,6 +68,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def format_question(row) -> str:
+    """Render a MedMCQA row's question and four options as plain text.
+
+    Args:
+        row: A dataset row with `Question`, `Option_A`, `Option_B`,
+            `Option_C`, and `Option_D` fields.
+
+    Returns:
+        str: The question followed by its four lettered options.
+    """
     return (
         f"{row['Question']}\n\n"
         f"A. {row['Option_A']}\n"
@@ -71,10 +87,30 @@ def format_question(row) -> str:
 
 
 def build_prompt(row) -> str:
+    """Build the instruction-tuning-style prompt used for this row's MCQ.
+
+    Args:
+        row: A dataset row with the fields `format_question` expects, plus `Label`.
+
+    Returns:
+        str: The full "### Instruction / ### Input / ### Response" prompt,
+        ready for tokenization.
+    """
     return f"### Instruction:\n{INSTRUCTION}\n\n### Input:\n{format_question(row)}\n\n### Response:\n"
 
 
 def load_eval_rows(max_eval_samples: int, seed: int):
+    """Load and subsample the MedMCQA dev split used for evaluation.
+
+    Args:
+        max_eval_samples (int): Number of rows to keep (matched to the
+            training runs' `--max_eval_samples` for a fair comparison).
+        seed (int): Random seed for row selection, matched to the training
+            runs' `--seed` so all three arms evaluate the same rows.
+
+    Returns:
+        list: The selected eval rows.
+    """
     print_banner("LOADING DATASET")
     # Same split choice as mcq_standard.py / grpo.py: "test" has Label=None for every row.
     eval_raw = load_dataset(DATASET_NAME, DATASET_CONFIG, split="dev")
@@ -85,6 +121,17 @@ def load_eval_rows(max_eval_samples: int, seed: int):
 
 
 def evaluate(model, tokenizer, eval_rows, max_length: int):
+    """Greedily generate an answer letter for each eval row and score accuracy/F1.
+
+    Args:
+        model: The PEFT-wrapped causal LM (4-bit base + bf16-trained adapter) to evaluate.
+        tokenizer: Tokenizer matching `model`.
+        eval_rows (list): Rows to evaluate, as returned by `load_eval_rows`.
+        max_length (int): Max prompt length passed to the tokenizer (truncation).
+
+    Returns:
+        dict: `{"accuracy": float, "f1_macro": float}` over `eval_rows`.
+    """
     print_banner("EVALUATION (4-bit-quantized base + bf16-trained adapter)")
     model.eval()
     predictions, ground_truths = [], []
@@ -107,6 +154,7 @@ def evaluate(model, tokenizer, eval_rows, max_length: int):
 
 
 def main():
+    """Load the 4-bit base + bf16-trained adapter, evaluate it, and write run_result.json."""
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Quantized inference of an unquantized-trained (bf16) adapter")

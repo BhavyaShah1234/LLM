@@ -23,6 +23,12 @@ from common.compare_runs import load_run_results, print_comparison_table
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for the three run output directories to compare.
+
+    Returns:
+        argparse.ArgumentParser: Parser with `--bf16_dir`, `--qlora_dir`, and
+        `--quantized_inference_dir` options.
+    """
     p = argparse.ArgumentParser(description="Compare QLoRA (quantized training) vs. quantizing a bf16-trained adapter for inference.")
     p.add_argument("--bf16_dir", type=str, default="./output/experiments/quantized-training-vs-quantized-inference/train-bf16")
     p.add_argument("--qlora_dir", type=str, default="./output/experiments/quantized-training-vs-quantized-inference/train-qlora")
@@ -31,6 +37,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _load(run_dir: str, label: str) -> dict:
+    """Load a single run's run_result.json, raising a helpful error if it's missing.
+
+    Args:
+        run_dir (str): Directory the run wrote its `run_result.json` into.
+        label (str): Human-readable name for this run, used in the error message.
+
+    Returns:
+        dict: The parsed run result for this run.
+
+    Raises:
+        FileNotFoundError: If `run_dir/run_result.json` doesn't exist.
+    """
     path = os.path.join(run_dir, "run_result.json")
     if not os.path.exists(path):
         raise FileNotFoundError(
@@ -41,6 +59,7 @@ def _load(run_dir: str, label: str) -> dict:
 
 
 def main():
+    """Load all three runs and print both the raw comparison table and the accuracy deltas vs. the bf16 reference."""
     args = build_arg_parser().parse_args()
     bf16 = _load(args.bf16_dir, "bf16-trained (reference)")
     qlora = _load(args.qlora_dir, "QLoRA (quantized training)")

@@ -11,6 +11,15 @@ from typing import Any, Dict, List, Optional, Sequence
 
 
 def load_run_results(paths: Sequence[str]) -> List[Dict[str, Any]]:
+    """Load a list of run_result.json files into memory.
+
+    Args:
+        paths (Sequence[str]): Filesystem paths to run_result.json files.
+
+    Returns:
+        List[Dict[str, Any]]: The parsed JSON contents, one dict per path, in
+            the same order as `paths`.
+    """
     results = []
     for path in paths:
         with open(path) as f:
@@ -19,8 +28,20 @@ def load_run_results(paths: Sequence[str]) -> List[Dict[str, Any]]:
 
 
 def _get_nested(record: Dict[str, Any], key: str):
-    """metric_keys may reference top-level fields (e.g. 'architecture') or
-    nested metrics (e.g. 'metrics.perplexity')."""
+    """Look up a possibly dotted key in a run-result record.
+
+    metric_keys may reference top-level fields (e.g. 'architecture') or
+    nested metrics (e.g. 'metrics.perplexity').
+
+    Args:
+        record (Dict[str, Any]): A single parsed run_result.json record.
+        key (str): Field name, optionally dotted to reach a nested dict
+            (e.g. "metrics.perplexity").
+
+    Returns:
+        The value at that key/path, or None if any segment of the path is
+        missing or not a dict.
+    """
     parts = key.split(".")
     value = record
     for part in parts:
@@ -37,6 +58,17 @@ def print_comparison_table(
     metric_keys: Sequence[str],
     title: Optional[str] = None,
 ) -> None:
+    """Print an ASCII table comparing run results side by side.
+
+    Args:
+        results (List[Dict[str, Any]]): Parsed run_result.json records, one
+            row per record.
+        group_by (str): Field (dotted path allowed) used as the first column,
+            identifying each row (e.g. "architecture" or "variant").
+        metric_keys (Sequence[str]): Additional fields (dotted paths allowed)
+            to print as columns, in order.
+        title (Optional[str]): If given, printed as a banner above the table.
+    """
     if title:
         print("=" * 80)
         print(title)

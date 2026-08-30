@@ -24,6 +24,11 @@ DEFAULT_COT_DIR = "./output/supervised-finetuning/text/classification/decoder-on
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for the no-CoT and CoT run output directories.
+
+    Returns:
+        argparse.ArgumentParser: Parser with `--no_cot_dir` and `--cot_dir` options.
+    """
     p = argparse.ArgumentParser(description="Compare CoT vs no-CoT text classification runs.")
     p.add_argument("--no_cot_dir", type=str, default=DEFAULT_NO_COT_DIR, help="Output dir passed to text_classification_no_cot.py's --output_dir.")
     p.add_argument("--cot_dir", type=str, default=DEFAULT_COT_DIR, help="Output dir passed to text_classification_cot.py's --output_dir.")
@@ -31,6 +36,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    """Load the CoT and no-CoT run_result.json files and print a comparison table."""
     args = build_arg_parser().parse_args()
     run_dirs = {"no_cot": args.no_cot_dir, "cot": args.cot_dir}
 

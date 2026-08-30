@@ -12,12 +12,26 @@ from typing import Callable, Optional
 
 
 def print_banner(title: str, width: int = 80) -> None:
+    """Print a title surrounded by `=`-rule lines.
+
+    Args:
+        title (str): Text to print between the two rules.
+        width (int): Width in characters of each `=` rule.
+    """
     print("=" * width)
     print(title)
     print("=" * width)
 
 
 def print_config(args: argparse.Namespace, task_description: str) -> None:
+    """Print a standardized startup banner listing every parsed CLI argument.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI arguments to dump, sorted by
+            name.
+        task_description (str): One-line description of what the script is
+            about to run, printed above the argument list.
+    """
     print_banner("CONFIGURATION")
     print(f"Task: {task_description}")
     for key, value in sorted(vars(args).items()):
@@ -38,6 +52,15 @@ def print_formatted_examples(
     its own rendering; the default assumes `example["input_ids"]` /
     `example["labels"]` are already tokenized with -100 masking applied, and
     prints the decoded input alongside which spans are masked vs. trained on.
+
+    Args:
+        dataset: A `datasets.Dataset`-like object supporting `__len__` and
+            integer indexing.
+        tokenizer: Tokenizer used to decode `input_ids`/`labels` when
+            `decode_fn` is not supplied.
+        num_examples (int): Maximum number of examples to print.
+        decode_fn (Optional[Callable]): Optional `(example, index, tokenizer)
+            -> str` override for rendering a single example.
     """
     print_banner("FORMATTED EXAMPLES")
     n = min(num_examples, len(dataset))

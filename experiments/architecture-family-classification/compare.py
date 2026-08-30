@@ -21,6 +21,12 @@ DEFAULT_ENCODER_DECODER_DIR = "./output/supervised-finetuning/text/classificatio
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for the three run output directories to compare.
+
+    Returns:
+        argparse.ArgumentParser: Parser with `--decoder_only_dir`,
+        `--encoder_only_dir`, and `--encoder_decoder_dir` options.
+    """
     p = argparse.ArgumentParser(description="Compare text classification across decoder-only, encoder-only, and encoder-decoder architectures.")
     p.add_argument("--decoder_only_dir", type=str, default=DEFAULT_DECODER_ONLY_DIR, help="Output dir passed to the decoder-only text_classification_standard.py's --output_dir.")
     p.add_argument("--encoder_only_dir", type=str, default=DEFAULT_ENCODER_ONLY_DIR, help="Output dir passed to the encoder-only text_classification_standard.py's --output_dir.")
@@ -29,6 +35,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    """Load the three architectures' run_result.json files and print a comparison table."""
     args = build_arg_parser().parse_args()
     run_dirs = {
         "decoder-only": args.decoder_only_dir,

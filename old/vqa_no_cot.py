@@ -14,6 +14,13 @@ import warnings
 warnings.filterwarnings("ignore")
 
 def parse_args():
+    """Parse command-line arguments for the no-CoT VQA fine-tuning run.
+
+    Returns:
+        argparse.Namespace: Parsed CLI arguments covering model choice,
+        quantization, LoRA, training hyperparameters, data limits, and
+        output/logging configuration.
+    """
     p=argparse.ArgumentParser()
     p.add_argument("--model",type=str,required=True,choices=["Qwen/Qwen2-VL-2B","Qwen/Qwen2-VL-2B-Instruct"])
     p.add_argument("--quantization",type=str,default="4bit",choices=["no","4bit","8bit"])
@@ -44,11 +51,47 @@ def parse_args():
     return p.parse_args()
 
 class VQADS(Dataset):
+    """Torch dataset formatting chart-VQA examples without reasoning.
+
+    Each item pairs an image with an instruction/question prompt whose
+    response is just the answer, processed jointly by a Qwen2-VL processor.
+    Falls back to a blank white image if none is present, and skips to the
+    next index on any processing error.
+
+    Attributes:
+        data: Formatted examples with `"question"`, `"answer"`, and
+            `"image"` keys.
+        proc: Qwen2-VL processor used to jointly encode text and image.
+        ml (int): Maximum tokenized sequence length.
+    """
+
     def __init__(self,d,proc,ml):
+        """Initialize the dataset.
+
+        Args:
+            d: Formatted examples with `"question"`, `"answer"`, and
+                `"image"` keys.
+            proc: Qwen2-VL processor used to jointly encode text and image.
+            ml (int): Maximum tokenized sequence length.
+        """
         self.data,self.proc,self.ml=d,proc,ml
     def __len__(self):
+        """Return the number of examples in the dataset.
+
+        Returns:
+            int: Number of examples.
+        """
         return len(self.data)
     def __getitem__(self,i):
+        """Format and process one example into model-ready tensors.
+
+        Args:
+            i (int): Index of the example to fetch.
+
+        Returns:
+            dict: Processor output (input_ids, attention_mask, pixel_values,
+            etc.) with the batch dimension squeezed out.
+        """
         it=self.data[i]
         try:
             img=it.get("image")
@@ -64,6 +107,18 @@ class VQADS(Dataset):
             return self.__getitem__((i+1)%len(self.data))
 
 def load_data(a):
+    """Stream and format up to 5000 chart-VQA examples without reasoning.
+
+    Streams `opendatalab/ChartVerse-SFT-1.8M`, normalizes question/answer/
+    image fields, carves off the last 10% as a test split, and optionally
+    truncates to `a.max_samples`.
+
+    Args:
+        a (argparse.Namespace): Parsed CLI args; uses `a.max_samples`.
+
+    Returns:
+        tuple[list[dict], list[dict]]: `(train_data, test_data)`.
+    """
     print("\\nLoading: opendatalab/ChartVerse-SFT-1.8M (NO CoT)")
     ds=load_dataset("opendatalab/ChartVerse-SFT-1.8M",split="train",streaming=True)
     def fmt(e):
@@ -80,6 +135,21 @@ def load_data(a):
     return tr,te
 
 def setup(a):
+    """Load the Qwen2-VL processor and quantized/LoRA-wrapped model.
+
+    Configures 4-bit/8-bit/no quantization per `a.quantization`, enables
+    gradient checkpointing if requested, and wraps the model with LoRA if
+    `a.lora` is set.
+
+    Args:
+        a (argparse.Namespace): Parsed CLI args; uses `a.model`,
+            `a.quantization`, `a.mixed_precision`, `a.gradient_checkpointing`,
+            `a.lora`, `a.lora_r`, `a.lora_alpha`, `a.lora_dropout`,
+            `a.lora_target_modules`.
+
+    Returns:
+        tuple: `(model, processor)`.
+    """
     proc=Qwen2VLProcessor.from_pretrained(a.model,trust_remote_code=True)
     qc=None
     if a.quantization=="4bit":
@@ -96,6 +166,12 @@ def setup(a):
     return m,proc
 
 def main():
+    """Run the end-to-end no-CoT VQA fine-tuning pipeline.
+
+    Parses args, seeds RNGs, and (unless `--debug_first_batch` is set)
+    streams/loads data, sets up the model, builds datasets, trains with
+    `Trainer`, and saves the model and processor to `a.output_dir`.
+    """
     a=parse_args()
     random.seed(a.seed);np.random.seed(a.seed);torch.manual_seed(a.seed)
     print(f"\\n{'='*80}\\nVQA WITHOUT CoT\\n{'='*80}")

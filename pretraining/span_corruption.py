@@ -38,6 +38,13 @@ ARCHITECTURE = "encoder-decoder"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering architecture sizing,
+        span-corruption noise parameters, data, training hyperparameters,
+        system, and debug options.
+    """
     p = argparse.ArgumentParser(description="Pretrain a small encoder-decoder model from scratch (span-corruption objective).")
 
     p.add_argument("--hidden_size", type=int, default=512, help="Transformer hidden size (d_model). Default: 512.")
@@ -74,6 +81,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset() -> None:
+    """Peek at the training split via streaming and assert a "text" field exists.
+
+    Raises:
+        AssertionError: If the first streamed example has no "text" field.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -85,12 +97,28 @@ def verify_dataset() -> None:
 
 
 def tokenize_and_pack(dataset, tokenizer, block_size: int, desc: str):
+    """Tokenize raw story text and pack it into fixed-length blocks (pre-corruption).
+
+    Args:
+        dataset (datasets.Dataset): Raw dataset with a "text" column.
+        tokenizer: Tokenizer to encode text with.
+        block_size (int): Number of tokens per packed block, before span
+            corruption shrinks the encoder input.
+        desc (str): Short label used in progress-bar descriptions (e.g.
+            "train" or "eval").
+
+    Returns:
+        datasets.Dataset: Dataset of fixed-length "input_ids" blocks, with
+        any trailing tokens shorter than block_size dropped.
+    """
     def tokenize_fn(examples):
+        """Tokenize a batch of stories without adding special tokens."""
         return tokenizer(examples["text"], add_special_tokens=False)
 
     tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=dataset.column_names, desc=f"Tokenizing ({desc})")
 
     def group_texts(examples):
+        """Concatenate a tokenized batch and split it into block_size chunks."""
         concatenated = sum(examples["input_ids"], [])
         total_length = (len(concatenated) // block_size) * block_size
         return {"input_ids": [concatenated[i : i + block_size] for i in range(0, total_length, block_size)]}
@@ -99,14 +127,39 @@ def tokenize_and_pack(dataset, tokenizer, block_size: int, desc: str):
 
 
 def random_spans_noise_mask(length: int, noise_density: float, mean_noise_span_length: float, rng: np.random.Generator) -> np.ndarray:
-    """Boolean mask over `length` positions marking which tokens are corrupted,
-    arranged as alternating non-noise/noise spans (T5 paper, Section 3.1.4)."""
+    """Build a boolean noise mask arranged as alternating non-noise/noise spans.
+
+    Boolean mask over `length` positions marking which tokens are corrupted,
+    arranged as alternating non-noise/noise spans (T5 paper, Section 3.1.4).
+
+    Args:
+        length (int): Number of positions to generate a mask for.
+        noise_density (float): Target fraction of positions marked noisy.
+        mean_noise_span_length (float): Target average length of each noisy
+            span.
+        rng (numpy.random.Generator): Random generator used to shuffle span
+            boundaries.
+
+    Returns:
+        numpy.ndarray: Boolean array of length `length`; True marks a
+        corrupted (noise) position.
+    """
     num_noise_tokens = int(round(length * noise_density))
     num_noise_tokens = min(max(num_noise_tokens, 1), length - 1)
     num_noise_spans = max(int(round(num_noise_tokens / mean_noise_span_length)), 1)
     num_nonnoise_tokens = length - num_noise_tokens
 
     def random_segmentation(num_items: int, num_segments: int) -> np.ndarray:
+        """Split num_items into num_segments randomly-sized, non-empty, ordered pieces.
+
+        Args:
+            num_items (int): Total number of items to distribute.
+            num_segments (int): Number of segments to split into.
+
+        Returns:
+            numpy.ndarray: Length-`num_segments` array of segment lengths
+            summing to `num_items`.
+        """
         mask_indices = np.arange(num_items - 1) < (num_segments - 1)
         rng.shuffle(mask_indices)
         first_in_segment = np.pad(mask_indices, [[1, 0]], constant_values=0)
@@ -126,6 +179,26 @@ def random_spans_noise_mask(length: int, noise_density: float, mean_noise_span_l
 
 
 def apply_span_corruption(token_ids, tokenizer, noise_density: float, mean_noise_span_length: float, rng: np.random.Generator):
+    """Replace noisy spans with sentinel tokens and build the reconstruction target.
+
+    Each contiguous noisy span in `token_ids` is collapsed to a single
+    `<extra_id_N>` sentinel in the encoder input; the decoder target
+    interleaves the same sentinels with the dropped tokens they replaced.
+
+    Args:
+        token_ids (list[int]): Token ids for one packed block.
+        tokenizer: Tokenizer used to look up sentinel token ids and the EOS
+            token id.
+        noise_density (float): Target fraction of positions marked noisy.
+        mean_noise_span_length (float): Target average length of each noisy
+            span.
+        rng (numpy.random.Generator): Random generator used to place spans.
+
+    Returns:
+        tuple[list[int], list[int]]: Encoder input ids (corrupted, sentinel-
+        substituted, EOS-terminated) and decoder target ids (sentinels plus
+        the dropped tokens, EOS-terminated).
+    """
     noise_mask = random_spans_noise_mask(len(token_ids), noise_density, mean_noise_span_length, rng)
     encoder_input_ids, target_ids = [], []
     sentinel_idx = 0
@@ -147,6 +220,19 @@ def apply_span_corruption(token_ids, tokenizer, noise_density: float, mean_noise
 
 
 def load_and_prepare_data(args, tokenizer):
+    """Load TinyStories, pack into blocks, and apply span corruption to each.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses max_samples,
+            sample_selection, max_eval_samples, seed, block_size,
+            noise_density, and mean_noise_span_length.
+        tokenizer: Tokenizer to encode text and look up sentinel/EOS ids.
+
+    Returns:
+        tuple[datasets.Dataset, datasets.Dataset]: Train and eval datasets
+        with "input_ids" (corrupted encoder input) and "labels"
+        (reconstruction target) columns.
+    """
     print_banner("LOADING DATASET")
     raw_train = load_dataset(DATASET_NAME, split="train")
     raw_eval = load_dataset(DATASET_NAME, split="validation")
@@ -165,6 +251,7 @@ def load_and_prepare_data(args, tokenizer):
     rng = np.random.default_rng(args.seed)
 
     def corrupt(example):
+        """Apply span corruption to one packed block, returning encoder/target ids."""
         enc, tgt = apply_span_corruption(example["input_ids"], tokenizer, args.noise_density, args.mean_noise_span_length, rng)
         return {"input_ids": enc, "labels": tgt}
 
@@ -175,6 +262,19 @@ def load_and_prepare_data(args, tokenizer):
 
 
 def build_model(args, tokenizer):
+    """Construct a randomly initialized T5-style model sized by CLI args.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses hidden_size,
+            num_encoder_layers, num_decoder_layers, num_attention_heads,
+            and gradient_checkpointing.
+        tokenizer: Tokenizer used to size the vocabulary and set special
+            token ids.
+
+    Returns:
+        transformers.PreTrainedModel: Freshly initialized encoder-decoder
+        model with tied embeddings.
+    """
     config = T5Config(
         vocab_size=len(tokenizer),
         d_model=args.hidden_size,
@@ -203,12 +303,32 @@ def build_model(args, tokenizer):
 
 
 def decode_example(example, index, tokenizer):
+    """Decode a corrupted encoder input and its reconstruction target for display.
+
+    Args:
+        example (dict): One dataset row with "input_ids" (corrupted encoder
+            input) and "labels" (reconstruction target) fields.
+        index (int): Row index; unused, present for print_formatted_examples'
+            decode_fn signature.
+        tokenizer: Tokenizer to decode ids with.
+
+    Returns:
+        str: Human-readable side-by-side of the encoder input and target.
+    """
     encoder_text = tokenizer.decode(example["input_ids"])
     target_text = tokenizer.decode(example["labels"])
     return f"Encoder input (corrupted):\n{encoder_text}\n\nDecoder target (reconstruction):\n{target_text}"
 
 
 def main():
+    """Parse CLI args, run from-scratch span-corruption pretraining, and write results.
+
+    Loads the tokenizer and data (with span corruption applied), builds a
+    randomly initialized model, optionally exits early for
+    --debug_first_batch, otherwise trains with Trainer, evaluates
+    reconstruction perplexity, saves the model, and writes a
+    run_result.json.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Span-corruption pretraining (encoder-decoder, from scratch)")

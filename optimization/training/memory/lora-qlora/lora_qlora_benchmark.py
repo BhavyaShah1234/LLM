@@ -55,6 +55,13 @@ CONFIGS = ["full", "lora", "qlora"]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this benchmark.
+
+    Returns:
+        argparse.ArgumentParser: Parser with all benchmark options (model,
+        synthetic-batch shape, step counts, learning rate, seed, output
+        dir, debug flag) registered.
+    """
     p = argparse.ArgumentParser(description="Benchmark full fine-tuning vs. LoRA vs. QLoRA on a real optimizer step.")
     p.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B-Base", help="Model to benchmark (local path or HF Hub id). Default: this project's usual base-model default -- large enough that full fine-tuning's optimizer-state cost is the point.")
     p.add_argument("--batch_size", type=int, default=1, help="Synthetic batch size. Default: 1.")
@@ -69,6 +76,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def build_synthetic_batch(vocab_size: int, batch_size: int, seq_len: int, device: str):
+    """Build a random-token CLM batch used to drive all three benchmark configurations.
+
+    Args:
+        vocab_size (int): Vocabulary size to sample token ids from.
+        batch_size (int): Number of sequences in the batch.
+        seq_len (int): Length of each sequence.
+        device (str): Torch device to place the tensors on.
+
+    Returns:
+        dict: `{"input_ids", "attention_mask", "labels"}` tensors, with
+        `labels` a clone of `input_ids` (standard CLM setup).
+    """
     input_ids = torch.randint(low=0, high=vocab_size, size=(batch_size, seq_len), device=device)
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.clone()
@@ -76,6 +95,17 @@ def build_synthetic_batch(vocab_size: int, batch_size: int, seq_len: int, device
 
 
 def load_model(model_name: str, config_name: str, device: str):
+    """Load a causal LM configured as `full`, `lora`, or `qlora`.
+
+    Args:
+        model_name (str): Local path or HF Hub id of the base checkpoint to load.
+        config_name (str): One of `CONFIGS` (`"full"`, `"lora"`, `"qlora"`) selecting the training configuration.
+        device (str): Torch device to move the model to (unused for `"qlora"`, which uses `device_map="auto"`).
+
+    Returns:
+        transformers.PreTrainedModel: The loaded model (optionally wrapped
+        with a LoRA adapter) in `.train()` mode.
+    """
     from transformers import AutoModelForCausalLM
 
     if config_name == "qlora":
@@ -94,12 +124,35 @@ def load_model(model_name: str, config_name: str, device: str):
 
 
 def count_params(model):
+    """Count trainable vs. total parameters of a model.
+
+    Args:
+        model (torch.nn.Module): Model to inspect.
+
+    Returns:
+        tuple[int, int]: `(trainable_params, total_params)`.
+    """
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     return trainable, total
 
 
 def run_benchmark(model, batch, num_steps: int, num_warmup: int, learning_rate: float, device: str):
+    """Time a real optimizer step (forward + backward + `optimizer.step()`) for one configuration.
+
+    Args:
+        model (torch.nn.Module): Model to benchmark, already in train mode on `device`.
+        batch (dict): Batch from `build_synthetic_batch`, already on `device`.
+        num_steps (int): Timed optimizer steps to run after warmup.
+        num_warmup (int): Untimed warmup steps run before timing starts.
+        learning_rate (float): AdamW learning rate for the trainable parameters.
+        device (str): Torch device the model and batch live on.
+
+    Returns:
+        tuple[float, float, float]: `(avg_step_seconds, peak_memory_mb, final_loss)`
+        -- mean wall-clock time per timed step, peak CUDA memory allocated
+        during the timed steps in MB, and the loss from the last timed step.
+    """
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
 
@@ -128,6 +181,14 @@ def run_benchmark(model, batch, num_steps: int, num_warmup: int, learning_rate: 
 
 
 def main():
+    """Run the full/LoRA/QLoRA benchmark and write a `run_result.json`.
+
+    Parses CLI args, builds a synthetic CLM batch, benchmarks each
+    configuration in `CONFIGS` (or just prints trainable-param counts if
+    `--debug_first_batch` is set), catching and recording per-configuration
+    OOMs as an expected finding rather than crashing, prints a summary, and
+    records the comparison via `common.run_results.write_run_result`.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "LoRA / QLoRA benchmark (full fine-tune vs. LoRA vs. QLoRA)")

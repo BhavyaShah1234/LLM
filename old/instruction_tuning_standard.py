@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Standard Instruction Tuning - ibivibiv/math_instruct
+"""Standard Instruction Tuning - ibivibiv/math_instruct"""
 import argparse, os, json, random
 from typing import Dict, List
 import numpy as np
@@ -21,6 +21,12 @@ SYSTEM_INSTRUCTIONS = [
 ]
 
 def parse_args():
+    """Parse CLI arguments controlling model choice, quantization/LoRA, and training hyperparameters.
+
+    Returns:
+        argparse.Namespace: parsed arguments consumed by `load_and_prepare_data`,
+        `setup_model_and_tokenizer`, and `main`.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True, choices=["Qwen/Qwen3-4B-Base", "Qwen/Qwen3-4B", "Qwen/Qwen3-4B-Thinking-2507", "Qwen/Qwen3-4B-Instruct-2507"])
     parser.add_argument("--quantization", type=str, default="4bit", choices=["no", "4bit", "8bit"])
@@ -51,13 +57,38 @@ def parse_args():
     return parser.parse_args()
 
 class InstructionDataset(Dataset):
+    """Torch dataset that formats instruction/input/output examples into an Alpaca-style prompt and masks the prompt out of the loss.
+
+    Attributes:
+        data (list): list of `{"instruction", "input", "output"}` examples.
+        tokenizer: tokenizer used to encode prompt and full (prompt + output) text.
+        max_length (int): max token length the full sequence is truncated to.
+    """
     def __init__(self, data, tokenizer, max_length):
+        """Store the examples, tokenizer, and max length used at `__getitem__` time.
+
+        Args:
+            data (list): list of `{"instruction", "input", "output"}` examples.
+            tokenizer: tokenizer with a callable `__call__` interface.
+            max_length (int): max sequence length passed to the tokenizer for the full text.
+        """
         self.data = data
         self.tokenizer = tokenizer
         self.max_length = max_length
     def __len__(self):
+        """Return the number of examples in the dataset."""
         return len(self.data)
     def __getitem__(self, idx):
+        """Tokenize example `idx` into an Alpaca-style prompt + output, masking the prompt in labels with -100.
+
+        Args:
+            idx (int): index of the example to fetch.
+
+        Returns:
+            dict: `input_ids`, `attention_mask`, and `labels` tensors for the example,
+            with label positions covering the prompt set to -100 so they're excluded
+            from the loss.
+        """
         item = self.data[idx]
         prompt = f"### Instruction:\n{item['instruction']}\n\n### Input:\n{item['input']}\n\n### Response:\n"
         full_text = prompt + item['output']
@@ -69,6 +100,15 @@ class InstructionDataset(Dataset):
         return {"input_ids": torch.tensor(input_ids), "attention_mask": torch.tensor(attention_mask), "labels": torch.tensor(labels)}
 
 def load_and_prepare_data(args):
+    """Load the math_instruct dataset, format examples with a random system instruction, and split into train/test.
+
+    Args:
+        args (argparse.Namespace): parsed CLI args; uses `max_samples` to optionally cap the
+            train/test set sizes.
+
+    Returns:
+        tuple[list, list]: `(train_data, test_data)` lists of `{"instruction", "input", "output"}` dicts.
+    """
     print("\nLoading dataset: ibivibiv/math_instruct")
     dataset = load_dataset("ibivibiv/math_instruct")
     def format_example(ex):
@@ -85,6 +125,15 @@ def load_and_prepare_data(args):
     return train_data, test_data
 
 def setup_model_and_tokenizer(args):
+    """Load the tokenizer and base model, applying quantization, gradient checkpointing, and LoRA per args.
+
+    Args:
+        args (argparse.Namespace): parsed CLI args controlling model name, quantization,
+            mixed precision, gradient checkpointing, and LoRA settings.
+
+    Returns:
+        tuple: `(model, tokenizer)` ready for training.
+    """
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -104,6 +153,7 @@ def setup_model_and_tokenizer(args):
     return model, tokenizer
 
 def main():
+    """Parse args, load data and model, and run the standard instruction-tuning training loop end to end."""
     args = parse_args()
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     print(f"\n{'='*80}\nInstruction Tuning Standard\n{'='*80}")

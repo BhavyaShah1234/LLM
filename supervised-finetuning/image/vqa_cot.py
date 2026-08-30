@@ -50,6 +50,12 @@ MAX_IMAGE_SIDE = 672
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model/quantization/LoRA,
+        optimization, data-selection, output, and debug flags.
+    """
     p = argparse.ArgumentParser(description="SFT a vision-language decoder-only model for VQA (with CoT).")
 
     p.add_argument("--model", type=str, default="Qwen/Qwen2-VL-2B", help="Base VL checkpoint (non-instruct). Default: Qwen/Qwen2-VL-2B (fp16 ~4.4GB).")
@@ -89,6 +95,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def load_and_resize_image(images_field) -> Image.Image:
+    """Extract the first image from a dataset row and downsize it.
+
+    Falls back to a blank placeholder when the row has no usable image, so
+    downstream batching never has to special-case a missing image.
+
+    Args:
+        images_field: The row's raw `images` value (expected to be a
+            sequence of PIL-like image objects, or empty/None).
+
+    Returns:
+        Image.Image: An RGB image thumbnailed to at most MAX_IMAGE_SIDE on
+        its longest side, or a 224x224 white placeholder if none was usable.
+    """
     if images_field and hasattr(images_field[0], "convert"):
         image = images_field[0].convert("RGB")
         image.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
@@ -97,6 +116,16 @@ def load_and_resize_image(images_field) -> Image.Image:
 
 
 def get_reasoning(row) -> str:
+    """Extract and clean the chain-of-thought text from a dataset row.
+
+    Args:
+        row: A raw dataset row expected to carry a `cot_solution` field.
+
+    Returns:
+        str: The row's `cot_solution` with any `<think>`/`</think>` tags
+        stripped and truncated to 800 characters, or a generic placeholder
+        sentence if the field is empty.
+    """
     # cot_solution's own text already includes a <think> wrapper (confirmed while smoke
     # testing -- a sample started with "<think>Okay, let's tackle this problem..."), so it
     # must be stripped here before this project's own <think>{reasoning}</think> wrapping is
@@ -107,16 +136,52 @@ def get_reasoning(row) -> str:
 
 
 class VQACoTDataset(Dataset):
+    """Torch dataset that formats VQA rows into CoT-wrapped prompt/response pairs.
+
+    Each item is tokenized with the image, with the prompt span masked out of
+    `labels` so loss is only computed on the reasoning and answer tokens.
+
+    Attributes:
+        rows: List of preprocessed dicts with `image`, `question`, `answer`,
+            and `reasoning` keys.
+        processor: The model's `AutoProcessor`, used for joint text/image
+            tokenization.
+        max_length: Max token length passed to the processor.
+        image_token: The processor's image placeholder token string.
+    """
+
     def __init__(self, rows, processor, max_length: int):
+        """Initialize the dataset.
+
+        Args:
+            rows: List of preprocessed row dicts (see class docstring).
+            processor: The model's `AutoProcessor`.
+            max_length (int): Max token length for truncation.
+        """
         self.rows = rows
         self.processor = processor
         self.max_length = max_length
         self.image_token = getattr(processor, "image_token", "<|image_pad|>")
 
     def __len__(self):
+        """Return the number of rows in the dataset.
+
+        Returns:
+            int: Number of rows.
+        """
         return len(self.rows)
 
     def __getitem__(self, idx):
+        """Build the tokenized, label-masked training example for one row.
+
+        Args:
+            idx: Index of the row to fetch.
+
+        Returns:
+            dict: `input_ids`, `attention_mask`, `labels` (prompt span set to
+            -100), `pixel_values`, and `image_grid_thw` tensors for the
+            example.
+        """
         row = self.rows[idx]
         image = row["image"]
         question = row["question"]
@@ -145,6 +210,17 @@ class VQACoTDataset(Dataset):
 
 
 def vqa_collate_fn(features, pad_token_id: int):
+    """Pad and stack a list of VQACoTDataset examples into a training batch.
+
+    Args:
+        features: List of per-example dicts as returned by
+            `VQACoTDataset.__getitem__`.
+        pad_token_id (int): Token id used to right-pad `input_ids`.
+
+    Returns:
+        dict: Batched `input_ids`, `attention_mask`, `labels` (padded with
+        -100), `pixel_values`, and `image_grid_thw` tensors.
+    """
     max_len = max(f["input_ids"].shape[0] for f in features)
     input_ids, attention_mask, labels = [], [], []
     for f in features:
@@ -162,6 +238,16 @@ def vqa_collate_fn(features, pad_token_id: int):
 
 
 def verify_dataset() -> None:
+    """Stream one example from DATASET_NAME and sanity-check its fields.
+
+    Asserts that `images`, `question`, `answer`, and `cot_solution` are all
+    present, and prints a preview of the extracted reasoning text. Not
+    called from `main()` by default (see the comment there) but kept for
+    manual verification.
+
+    Raises:
+        AssertionError: If any expected field is missing from the dataset.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -174,6 +260,19 @@ def verify_dataset() -> None:
 
 
 def load_and_prepare_data(args, processor):
+    """Stream, preprocess, split, and subsample the dataset into train/eval sets.
+
+    Args:
+        args: Parsed CLI namespace; uses `max_samples`, `sample_selection`,
+            `max_eval_samples`, `seed`, and `max_length`.
+        processor: The model's `AutoProcessor`, passed through to the
+            returned datasets.
+
+    Returns:
+        tuple: `(train_dataset, eval_dataset, eval_rows)` where the first
+        two are `VQACoTDataset` instances and `eval_rows` is the raw list of
+        eval-split row dicts (used later for generation-based evaluation).
+    """
     print_banner("LOADING DATASET")
     raw = load_dataset(DATASET_NAME, split="train", streaming=True)
     rows = [
@@ -212,6 +311,18 @@ def load_and_prepare_data(args, processor):
 
 
 def print_formatted_examples_vqa(dataset, processor, num_examples=2):
+    """Print decoded prompt/response text for a few dataset examples.
+
+    Used by `--debug_first_batch` to visually confirm formatting and label
+    masking before committing to a full training run.
+
+    Args:
+        dataset: A `VQACoTDataset` (or compatible indexable dataset) to
+            sample from.
+        processor: The model's `AutoProcessor`, used to decode token ids
+            back to text.
+        num_examples: Maximum number of examples to print. Defaults to 2.
+    """
     print_banner("FORMATTED EXAMPLES")
     for i in range(min(num_examples, len(dataset))):
         example = dataset[i]
@@ -228,6 +339,20 @@ def print_formatted_examples_vqa(dataset, processor, num_examples=2):
 
 
 def evaluate_model(model, processor, eval_rows, args):
+    """Generate answers for the eval set and score them.
+
+    Args:
+        model: The trained (or base) vision-language model to generate from.
+        processor: The model's `AutoProcessor`, used to build prompts and
+            decode generations.
+        eval_rows: Raw eval-split row dicts (as returned by
+            `load_and_prepare_data`) to evaluate on.
+        args: Parsed CLI namespace; uses `max_length`.
+
+    Returns:
+        dict: `exact_match_accuracy`, `bertscore_f1` (or None if scoring
+        failed), `cot_enabled`, `cot_usage_rate`, and `avg_cot_length_words`.
+    """
     print_banner("EVALUATION")
     model.eval()
     predictions, references, cot_outputs = [], [], []
@@ -278,6 +403,13 @@ def evaluate_model(model, processor, eval_rows, args):
 
 
 def main():
+    """Run the full CoT VQA SFT pipeline: load, train, evaluate, save, record.
+
+    Parses CLI args, loads and preprocesses the dataset, loads the base
+    vision-language model (optionally quantized/LoRA-adapted), either dumps
+    formatted debug examples and exits or trains via `Trainer`, evaluates
+    the result, saves the model, and writes a `run_result.json`.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "VQA SFT -- decoder-only (vision-language), with CoT")

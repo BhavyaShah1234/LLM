@@ -64,6 +64,13 @@ ARCHITECTURE = "decoder-only"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this benchmark.
+
+    Returns:
+        argparse.ArgumentParser: Parser with all benchmark options (model,
+        synthetic-batch shape, step counts, learning rate, DeepSpeed master
+        port, seed, output dir, debug flag) registered.
+    """
     p = argparse.ArgumentParser(description="Benchmark plain AdamW vs. DeepSpeed ZeRO Stage 2 with CPU optimizer offload.")
     p.add_argument("--model", type=str, default="./output/pretraining/clm", help="Model to benchmark. Default: this project's own from-scratch CLM checkpoint -- see module docstring for why (CPU RAM budget for the offloaded optimizer state).")
     p.add_argument("--batch_size", type=int, default=8, help="Synthetic batch size. Default: 8.")
@@ -79,14 +86,43 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def build_synthetic_batch(vocab_size: int, batch_size: int, seq_len: int, device: str):
+    """Build a random-token CLM batch used to drive both benchmark configurations.
+
+    Args:
+        vocab_size (int): Vocabulary size to sample token ids from.
+        batch_size (int): Number of sequences in the batch.
+        seq_len (int): Length of each sequence.
+        device (str): Torch device to place the tensors on.
+
+    Returns:
+        dict: ``{"input_ids": Tensor, "labels": Tensor}`` with `labels` a
+        clone of `input_ids` (standard CLM next-token-prediction setup).
+    """
     input_ids = torch.randint(low=0, high=vocab_size, size=(batch_size, seq_len), device=device)
     labels = input_ids.clone()
     return {"input_ids": input_ids, "labels": labels}
 
 
 def run_baseline(model_path: str, batch, num_steps: int, num_warmup: int, learning_rate: float, device: str):
-    """Plain AdamW, all state on GPU -- measured before DeepSpeed's
-    distributed process group is ever created in this process.
+    """Time plain AdamW with all optimizer state on GPU.
+
+    Measured before DeepSpeed's distributed process group is ever created
+    in this process (see module docstring: reverting a process from
+    distributed back to non-distributed isn't guaranteed once a NCCL group
+    exists).
+
+    Args:
+        model_path (str): Path or hub id of the causal LM checkpoint to load.
+        batch (dict): Synthetic batch from `build_synthetic_batch`, already on `device`.
+        num_steps (int): Timed optimizer steps to run after warmup.
+        num_warmup (int): Untimed warmup steps run before timing starts.
+        learning_rate (float): AdamW learning rate.
+        device (str): Torch device to run on (e.g. `"cuda"`).
+
+    Returns:
+        tuple[float, float, float]: `(avg_step_seconds, peak_memory_mb, final_loss)`
+        -- mean wall-clock time per timed step, peak CUDA memory allocated
+        during the timed steps in MB, and the loss from the last timed step.
     """
     from common.model_loading import load_causal_lm
 
@@ -120,7 +156,25 @@ def run_baseline(model_path: str, batch, num_steps: int, num_warmup: int, learni
 
 
 def run_zero_offload(model_path: str, batch, num_steps: int, num_warmup: int, learning_rate: float, master_port: str):
-    """DeepSpeed ZeRO Stage 2, optimizer state offloaded to CPU RAM."""
+    """Time DeepSpeed ZeRO Stage 2 with the optimizer state offloaded to CPU RAM.
+
+    Initializes a single-process DeepSpeed distributed group, wraps the
+    model with ZeRO Stage 2 CPU-offloaded AdamW, and times the same
+    warmup/timed-step structure as `run_baseline`.
+
+    Args:
+        model_path (str): Path or hub id of the causal LM checkpoint to load.
+        batch (dict): Synthetic batch from `build_synthetic_batch`; moved onto the DeepSpeed engine's device internally.
+        num_steps (int): Timed optimizer steps to run after warmup.
+        num_warmup (int): Untimed warmup steps run before timing starts.
+        learning_rate (float): AdamW learning rate.
+        master_port (str): Port used for DeepSpeed's single-process distributed init.
+
+    Returns:
+        tuple[float, float, float]: `(avg_step_seconds, peak_memory_mb, final_loss)`
+        -- mean wall-clock time per timed step, peak CUDA memory allocated
+        during the timed steps in MB, and the loss from the last timed step.
+    """
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
     os.environ.setdefault("LOCAL_RANK", "0")
@@ -170,6 +224,13 @@ def run_zero_offload(model_path: str, batch, num_steps: int, num_warmup: int, le
 
 
 def main():
+    """Run the baseline-vs-ZeRO-offload benchmark and write a `run_result.json`.
+
+    Parses CLI args, builds a synthetic CLM batch, benchmarks plain AdamW
+    then DeepSpeed ZeRO Stage 2 CPU offload (or just one debug step of each
+    if `--debug_first_batch` is set), prints a summary, and records the
+    comparison via `common.run_results.write_run_result`.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "DeepSpeed ZeRO Stage 2 (CPU optimizer offload) benchmark")

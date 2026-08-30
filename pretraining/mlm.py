@@ -38,6 +38,12 @@ ARCHITECTURE = "encoder-only"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering architecture sizing, data,
+        training hyperparameters, system, and debug options.
+    """
     p = argparse.ArgumentParser(description="Pretrain a small encoder-only model from scratch (MLM objective).")
 
     p.add_argument("--hidden_size", type=int, default=512, help="Transformer hidden size. Default: 512.")
@@ -72,6 +78,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset() -> None:
+    """Peek at the training split via streaming and assert a "text" field exists.
+
+    Raises:
+        AssertionError: If the first streamed example has no "text" field.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -83,12 +94,30 @@ def verify_dataset() -> None:
 
 
 def tokenize_and_pack(dataset, tokenizer, block_size: int, desc: str):
+    """Tokenize raw story text and pack it into fixed-length MLM blocks.
+
+    Masking itself is not applied here -- it happens per-batch at train time
+    via DataCollatorForLanguageModeling(mlm=True).
+
+    Args:
+        dataset (datasets.Dataset): Raw dataset with a "text" column.
+        tokenizer: Tokenizer to encode text with.
+        block_size (int): Number of tokens per packed training block.
+        desc (str): Short label used in progress-bar descriptions (e.g.
+            "train" or "eval").
+
+    Returns:
+        datasets.Dataset: Dataset of fixed-length "input_ids" blocks, with
+        any trailing tokens shorter than block_size dropped.
+    """
     def tokenize_fn(examples):
+        """Tokenize a batch of stories without adding special tokens."""
         return tokenizer(examples["text"], add_special_tokens=False)
 
     tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=dataset.column_names, desc=f"Tokenizing ({desc})")
 
     def group_texts(examples):
+        """Concatenate a tokenized batch and split it into block_size chunks."""
         concatenated = {k: sum(examples[k], []) for k in examples.keys()}
         total_length = (len(concatenated["input_ids"]) // block_size) * block_size
         result = {
@@ -101,6 +130,17 @@ def tokenize_and_pack(dataset, tokenizer, block_size: int, desc: str):
 
 
 def load_and_prepare_data(args, tokenizer):
+    """Load the TinyStories train/validation splits and tokenize+pack them.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses max_samples,
+            sample_selection, max_eval_samples, seed, and block_size.
+        tokenizer: Tokenizer to encode text with.
+
+    Returns:
+        tuple[datasets.Dataset, datasets.Dataset]: Packed train and eval
+        datasets of fixed-length blocks.
+    """
     print_banner("LOADING DATASET")
     raw_train = load_dataset(DATASET_NAME, split="train")
     raw_eval = load_dataset(DATASET_NAME, split="validation")
@@ -121,6 +161,18 @@ def load_and_prepare_data(args, tokenizer):
 
 
 def build_model(args, tokenizer):
+    """Construct a randomly initialized BERT-style model sized by CLI args.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses hidden_size,
+            num_layers, num_attention_heads, block_size, and
+            gradient_checkpointing.
+        tokenizer: Tokenizer used to size the vocabulary and set the pad
+            token id.
+
+    Returns:
+        transformers.PreTrainedModel: Freshly initialized encoder-only model.
+    """
     config = BertConfig(
         vocab_size=len(tokenizer),
         hidden_size=args.hidden_size,
@@ -150,11 +202,30 @@ def build_model(args, tokenizer):
 
 
 def decode_example(example, index, tokenizer):
+    """Decode a single packed block back to text for --debug_first_batch display.
+
+    Args:
+        example (dict): One packed dataset row with an "input_ids" field.
+        index (int): Row index; unused, present for print_formatted_examples'
+            decode_fn signature.
+        tokenizer: Tokenizer to decode input_ids with.
+
+    Returns:
+        str: Human-readable summary of the block's token count and
+        (pre-masking) text.
+    """
     text = tokenizer.decode(example["input_ids"])
     return f"Packed block ({len(example['input_ids'])} tokens, unmasked -- masking is applied per-batch at train time):\n{text}"
 
 
 def main():
+    """Parse CLI args, run from-scratch MLM pretraining, and write results.
+
+    Loads the tokenizer and data, builds a randomly initialized model,
+    optionally exits early for --debug_first_batch, otherwise trains with
+    Trainer using a masking data collator, evaluates pseudo-perplexity,
+    saves the model, and writes a run_result.json.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Masked Language Modelling pretraining (encoder-only, from scratch)")

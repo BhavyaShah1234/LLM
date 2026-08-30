@@ -45,6 +45,12 @@ ANSWER_LETTER_RE = re.compile(r"\b([A-D])\b")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model/LoRA/quantization
+        serving options, benchmark sizing, and output/debug options.
+    """
     p = argparse.ArgumentParser(description="Serve a model with vLLM and benchmark throughput/latency, optionally with a LoRA adapter attached natively.")
     p.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B", help="Base model to serve (HF Hub id or local path). Default matches rlhf/'s default.")
     p.add_argument("--lora_path", type=str, default=None, help="Path to a LoRA adapter directory (adapter_config.json + adapter_model.safetensors, e.g. this project's own adapter_only saves) to attach natively via vLLM's LoRARequest. Default: none (serve the base model only).")
@@ -62,6 +68,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def format_question(row) -> str:
+    """Render a MedMCQA row's question and four options as plain text.
+
+    Args:
+        row: Mapping with "Question", "Option_A", "Option_B", "Option_C",
+            and "Option_D" keys.
+
+    Returns:
+        str: The question followed by lettered options A-D, one per line.
+    """
     return (
         f"{row['Question']}\n\n"
         f"A. {row['Option_A']}\n"
@@ -72,20 +87,57 @@ def format_question(row) -> str:
 
 
 def build_prompt(row) -> str:
+    """Wrap a formatted question in the instruction/input/response template.
+
+    Args:
+        row: Mapping with "Question", "Option_A", "Option_B", "Option_C",
+            and "Option_D" keys.
+
+    Returns:
+        str: Full prompt text ending at "### Response:\\n", ready for
+        generation. Matches rlhf/grpo/grpo.py's prompt format.
+    """
     return f"### Instruction:\n{INSTRUCTION}\n\n### Input:\n{format_question(row)}\n\n### Response:\n"
 
 
 def extract_answer_letter(completion: str):
+    """Extract the first standalone answer letter (A-D) from a completion.
+
+    Args:
+        completion (str): Raw model completion text.
+
+    Returns:
+        str | None: The matched letter, or None if no letter was found.
+    """
     match = ANSWER_LETTER_RE.search(completion.strip().upper())
     return match.group(1) if match else None
 
 
 def accuracy(completions, labels) -> float:
+    """Compute exact-match accuracy of extracted answer letters against labels.
+
+    Args:
+        completions (list[str]): Model completions.
+        labels (list[str]): Ground-truth answer letters, aligned with
+            completions.
+
+    Returns:
+        float: Fraction of completions whose extracted letter matches the
+        corresponding label.
+    """
     correct = sum(1 for c, l in zip(completions, labels) if extract_answer_letter(c) == l)
     return correct / len(labels)
 
 
 def main():
+    """Parse CLI args, serve a model with vLLM, benchmark it, and write results.
+
+    Loads MedMCQA dev prompts, starts a vLLM engine (optionally with LoRA
+    enabled), optionally exits early for --debug_first_batch, otherwise
+    benchmarks base-model throughput/accuracy and, if --lora_path is set,
+    LoRA-adapted throughput/accuracy on the same prompts, then writes a
+    run_result.json.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "vLLM serving benchmark")

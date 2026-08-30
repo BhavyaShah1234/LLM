@@ -41,6 +41,13 @@ INSTRUCTION = "Classify whether the following text is real news or fake news."
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for the no-CoT fake-news classification run.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model/quantization, LoRA,
+            optimization, data-selection, output/checkpointing, and
+            seed/debug flags for this script.
+    """
     p = argparse.ArgumentParser(description="SFT a decoder-only model for fake-news classification (no CoT).")
 
     p.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B-Base", help="Base checkpoint to finetune. Default: Qwen/Qwen3-1.7B-Base.")
@@ -80,15 +87,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 class ClassificationDataset(Dataset):
+    """Tokenized real/fake-news classification dataset (label only, no CoT).
+
+    Formats each row as an instruction/response prompt where the response is
+    just the "real"/"fake" label, and masks the loss on the
+    instruction/input prefix so loss is computed on the label tokens only.
+
+    Attributes:
+        rows (list): Raw dataset rows (dicts with "input", "status").
+        tokenizer: Tokenizer used to encode prompts and responses.
+        max_length (int): Max token length the full prompt+response is
+            truncated to.
+    """
+
     def __init__(self, rows, tokenizer, max_length: int):
+        """Initialize the dataset from raw rows.
+
+        Args:
+            rows (list): Raw dataset rows (dicts with "input", "status").
+            tokenizer: Tokenizer used to encode prompts and responses.
+            max_length (int): Max token length for truncation.
+        """
         self.rows = rows
         self.tokenizer = tokenizer
         self.max_length = max_length
 
     def __len__(self):
+        """Return the number of rows in the dataset.
+
+        Returns:
+            int: Number of rows.
+        """
         return len(self.rows)
 
     def __getitem__(self, idx):
+        """Build the tokenized prompt/response pair for one row.
+
+        Args:
+            idx (int): Row index.
+
+        Returns:
+            dict: `input_ids`, `attention_mask`, and `labels` (with the
+                instruction/input prefix masked to -100, loss on the label
+                tokens only).
+        """
         row = self.rows[idx]
         text = row["input"][:2000]
         label_text = LABEL_MAP[row["status"]]
@@ -108,6 +150,12 @@ class ClassificationDataset(Dataset):
 
 
 def verify_dataset() -> None:
+    """Peek the dataset (streaming) and assert the expected fields exist.
+
+    Raises:
+        AssertionError: If `input` or `status` is missing from the first
+            streamed example.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -120,6 +168,18 @@ def verify_dataset() -> None:
 
 
 def load_and_prepare_data(args, tokenizer):
+    """Load the dataset, carve out an eval split, and wrap both in datasets.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `max_samples`,
+            `sample_selection`, `max_eval_samples`, `seed`, and `max_length`.
+        tokenizer: Tokenizer passed through to the built datasets.
+
+    Returns:
+        tuple: `(train_dataset, eval_dataset, eval_rows)` where the first two
+            are `ClassificationDataset` instances and `eval_rows` is the raw
+            (untokenized) eval rows used for generation-based evaluation.
+    """
     print_banner("LOADING DATASET")
     train_raw = load_dataset(DATASET_NAME, split="train")
 
@@ -147,6 +207,18 @@ def load_and_prepare_data(args, tokenizer):
 
 
 def decode_example(example, index, tokenizer):
+    """Render one tokenized training example as human-readable text for debug printing.
+
+    Args:
+        example (dict): Tokenized example with `input_ids` and `labels`.
+        index (int): Position of this example in the batch (unused, kept for
+            the shared `decode_fn` signature used by `print_formatted_examples`).
+        tokenizer: Tokenizer used to decode the token ids back to text.
+
+    Returns:
+        str: The full prompt+response text, plus the decoded label tokens
+            that loss is actually computed on.
+    """
     input_ids = example["input_ids"]
     labels = example["labels"]
     full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
@@ -156,6 +228,21 @@ def decode_example(example, index, tokenizer):
 
 
 def evaluate_model(model, tokenizer, eval_rows, args):
+    """Generate a short label completion per eval row and score it.
+
+    Parses the generated text for the "fake"/"real" keyword (defaulting to
+    "real" when neither is found), then computes classification metrics.
+
+    Args:
+        model: The (possibly LoRA-wrapped) causal LM to evaluate.
+        tokenizer: Tokenizer used for prompting and decoding generations.
+        eval_rows (list): Raw eval rows (dicts with "input", "status").
+        args (argparse.Namespace): Parsed CLI args; uses `max_length`.
+
+    Returns:
+        dict: Accuracy, macro/weighted F1, precision, recall, and AUROC (or
+            `None` if undefined).
+    """
     print_banner("EVALUATION")
     model.eval()
     predictions, ground_truths = [], []
@@ -202,6 +289,12 @@ def evaluate_model(model, tokenizer, eval_rows, args):
 
 
 def main():
+    """Run the full no-CoT fake-news classification SFT pipeline end to end.
+
+    Parses CLI args, loads the tokenizer/dataset/model (optionally
+    quantized/LoRA), either prints a debug batch and exits or trains,
+    evaluates, saves the model, and writes a `run_result.json`.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Text classification SFT -- decoder-only, no CoT")

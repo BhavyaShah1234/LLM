@@ -33,6 +33,12 @@ from common.compare_runs import load_run_results, print_comparison_table
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for the five PTQ/QAT/ablation run output directories.
+
+    Returns:
+        argparse.ArgumentParser: Parser with `--ptq_8bit_dir`, `--ptq_4bit_dir`,
+        `--qat_8bit_dir`, `--qat_4bit_dir`, and `--qat_ablation_dir` options.
+    """
     p = argparse.ArgumentParser(description="Compare QAT vs PTQ, isolating the quantization effect from the 'more training helps' confound.")
     p.add_argument("--ptq_8bit_dir", type=str, default="./output/optimization/ptq")
     p.add_argument("--ptq_4bit_dir", type=str, default="./output/optimization/ptq-4bit")
@@ -43,6 +49,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _load(run_dir: str, label: str) -> dict:
+    """Load a single run's run_result.json, raising a helpful error if it's missing.
+
+    Args:
+        run_dir (str): Directory the run wrote its `run_result.json` into.
+        label (str): Human-readable name for this run, used in the error message.
+
+    Returns:
+        dict: The parsed run result for this run.
+
+    Raises:
+        FileNotFoundError: If `run_dir/run_result.json` doesn't exist.
+    """
     path = os.path.join(run_dir, "run_result.json")
     if not os.path.exists(path):
         raise FileNotFoundError(
@@ -54,6 +72,7 @@ def _load(run_dir: str, label: str) -> dict:
 
 
 def main():
+    """Load all five runs, print the raw comparison table, and derive the isolated marginal quantization cost for PTQ vs QAT."""
     args = build_arg_parser().parse_args()
 
     ptq8 = _load(args.ptq_8bit_dir, "ptq 8-bit")

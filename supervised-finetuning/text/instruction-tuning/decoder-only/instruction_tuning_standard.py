@@ -59,6 +59,13 @@ SYSTEM_INSTRUCTIONS = [
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this training script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model/quantization, LoRA,
+            training hyperparameters, data sampling, output/checkpointing,
+            and seeding/debug flags.
+    """
     p = argparse.ArgumentParser(description="SFT a decoder-only model for instruction tuning (standard, math).")
 
     p.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B-Base", help="Base checkpoint. Default: Qwen/Qwen3-1.7B-Base.")
@@ -98,16 +105,51 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 class InstructionDataset(Dataset):
+    """Tokenized instruction-tuning dataset with a randomized system-instruction persona per example.
+
+    Formats each row as ``### Instruction: ... ### Input: ... ### Response: {output}``
+    and masks the prompt portion out of the loss (labels set to -100), so only
+    the response tokens contribute to training loss.
+
+    Attributes:
+        rows (list): Raw dataset rows, each with "instruction" and "output" fields.
+        tokenizer: Tokenizer used to encode prompt and full text.
+        max_length (int): Max sequence length used when tokenizing the full example.
+        rng (random.Random): RNG used to pick a system-instruction persona per example.
+    """
+
     def __init__(self, rows, tokenizer, max_length: int, seed: int):
+        """Initialize the dataset.
+
+        Args:
+            rows (list): Raw dataset rows, each with "instruction" and "output" fields.
+            tokenizer: Tokenizer used to encode prompt and full text.
+            max_length (int): Max sequence length used when tokenizing the full example.
+            seed (int): Seed for the per-example system-instruction persona RNG.
+        """
         self.rows = rows
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.rng = random.Random(seed)
 
     def __len__(self):
+        """Return the number of examples in the dataset.
+
+        Returns:
+            int: Number of rows.
+        """
         return len(self.rows)
 
     def __getitem__(self, idx):
+        """Build a tokenized, loss-masked training example.
+
+        Args:
+            idx (int): Index of the row to fetch.
+
+        Returns:
+            dict: ``input_ids``, ``attention_mask``, and ``labels`` (prompt
+                tokens masked with -100 so loss is computed on the response only).
+        """
         row = self.rows[idx]
         instruction = self.rng.choice(SYSTEM_INSTRUCTIONS)
         prompt = f"### Instruction:\n{instruction}\n\n### Input:\n{row['instruction']}\n\n### Response:\n"
@@ -125,6 +167,11 @@ class InstructionDataset(Dataset):
 
 
 def verify_dataset() -> None:
+    """Peek the dataset via streaming and assert the expected fields are present.
+
+    Not called by default in ``main`` (see the comment there) since it would
+    otherwise trigger a second streaming pass over the same dataset.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -136,6 +183,22 @@ def verify_dataset() -> None:
 
 
 def load_and_prepare_data(args, tokenizer):
+    """Stream and materialize a capped slice of the dataset, then split and sample it.
+
+    Streams up to ``MAX_RAW_EXAMPLES`` rows (required since the full dataset
+    is 114M rows / ~10GB), carves off a 10% eval slice, and applies
+    ``args.max_samples``/``args.sample_selection`` to the remaining train rows.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses ``max_samples``,
+            ``sample_selection``, ``max_eval_samples``, ``max_length``, and ``seed``.
+        tokenizer: Tokenizer passed through to the constructed datasets.
+
+    Returns:
+        tuple: ``(train_dataset, eval_dataset, eval_rows)`` where the first two
+            are :class:`InstructionDataset` instances and ``eval_rows`` is the
+            raw (untokenized) list of eval rows for later generation-based evaluation.
+    """
     print_banner("LOADING DATASET")
     # ibivibiv/math_instruct has 114M rows / ~10GB -- streaming with a cap on
     # how many raw rows get materialized, rather than downloading the full
@@ -175,6 +238,18 @@ def load_and_prepare_data(args, tokenizer):
 
 
 def decode_example(example, index, tokenizer):
+    """Render a tokenized example back to text for ``--debug_first_batch`` inspection.
+
+    Args:
+        example (dict): Tokenized example with ``input_ids`` and ``labels``.
+        index (int): Position of this example in the batch being printed (unused
+            in the body but kept for a uniform ``decode_fn`` signature).
+        tokenizer: Tokenizer used to decode ``input_ids`` and the unmasked labels.
+
+    Returns:
+        str: Human-readable dump of the full formatted text and the response
+            portion the loss is actually computed on.
+    """
     input_ids = example["input_ids"]
     labels = example["labels"]
     full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
@@ -184,6 +259,19 @@ def decode_example(example, index, tokenizer):
 
 
 def evaluate_model(model, tokenizer, eval_rows, args):
+    """Generate responses for the eval rows and score them with ROUGE-L and BERTScore.
+
+    Args:
+        model: Trained causal LM used for generation.
+        tokenizer: Tokenizer used to build prompts and decode generations.
+        eval_rows (list): Raw eval rows with "instruction" and "output" fields.
+        args (argparse.Namespace): Parsed CLI args; uses ``seed`` and ``max_length``.
+
+    Returns:
+        dict: ``{"rouge_l": float, "bertscore_f1": float | None}``; BERTScore
+            is ``None`` if it raised an exception (network/model-download
+            failure) rather than aborting the whole eval.
+    """
     print_banner("EVALUATION")
     model.eval()
     predictions, references = [], []
@@ -217,6 +305,7 @@ def evaluate_model(model, tokenizer, eval_rows, args):
 
 
 def main():
+    """Run the end-to-end instruction-tuning pipeline: load, train, evaluate, save, record."""
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Instruction tuning SFT -- decoder-only, standard (math)")

@@ -46,6 +46,13 @@ PREFIX = "classify sentiment: "
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for the encoder-decoder classification run.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model/precision, optimization,
+            data-selection, output/checkpointing, and seed/debug flags for
+            this script.
+    """
     p = argparse.ArgumentParser(description="SFT an encoder-decoder model for text classification (text-to-text).")
 
     p.add_argument("--model", type=str, default="t5-base", help="Encoder-decoder base checkpoint (raw, non-instruction-tuned). Default: t5-base (fp16 ~0.9GB).")
@@ -77,6 +84,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset() -> None:
+    """Peek the dataset (streaming) and assert the expected fields exist.
+
+    Raises:
+        AssertionError: If `sentence` or `label` is missing from the first
+            streamed example.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -89,6 +102,21 @@ def verify_dataset() -> None:
 
 
 def load_and_prepare_data(args, tokenizer):
+    """Load the train/eval splits and tokenize them as text-to-text pairs.
+
+    Prefixes each sentence with the `"classify sentiment: "` task prefix and
+    tokenizes the label word as the decoder target.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `max_samples`,
+            `sample_selection`, `max_eval_samples`, `seed`, `max_length`, and
+            `max_target_length`.
+        tokenizer: Tokenizer used to encode inputs and targets.
+
+    Returns:
+        tuple: `(train_dataset, eval_dataset)`, HF `Dataset` objects with
+            `input_ids`, `attention_mask`, and `labels` columns.
+    """
     print_banner("LOADING DATASET")
     train_raw = load_dataset(DATASET_NAME, split="train")
     eval_raw = load_dataset(DATASET_NAME, split="eval")
@@ -97,6 +125,16 @@ def load_and_prepare_data(args, tokenizer):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def tokenize_fn(examples):
+        """Tokenize a batch of raw examples into text-to-text model inputs.
+
+        Args:
+            examples (dict): Batched raw rows with `sentence` and `label`
+                columns (as produced by `Dataset.map(batched=True)`).
+
+        Returns:
+            dict: Tokenized `input_ids`/`attention_mask` for the prefixed
+                sentence plus tokenized `labels` for the target label word.
+        """
         inputs = [PREFIX + s for s in examples["sentence"]]
         model_inputs = tokenizer(inputs, truncation=True, max_length=args.max_length)
         targets = [LABEL_MAP[l] for l in examples["label"]]
@@ -114,6 +152,13 @@ def load_and_prepare_data(args, tokenizer):
 
 
 def print_formatted_examples_t5(dataset, tokenizer, num_examples=2):
+    """Print a few tokenized encoder-input/decoder-target pairs for debugging.
+
+    Args:
+        dataset: Tokenized HF `Dataset` with `input_ids` and `labels` columns.
+        tokenizer: Tokenizer used to decode the token ids back to text.
+        num_examples (int): Number of examples to print. Default: 2.
+    """
     print_banner("FORMATTED EXAMPLES")
     for i in range(min(num_examples, len(dataset))):
         example = dataset[i]
@@ -124,7 +169,28 @@ def print_formatted_examples_t5(dataset, tokenizer, num_examples=2):
 
 
 def build_compute_metrics(tokenizer):
+    """Build a `Seq2SeqTrainer`-compatible `compute_metrics` callback.
+
+    Args:
+        tokenizer: Tokenizer used to decode generated/target token ids back
+            to label text.
+
+    Returns:
+        Callable: A `compute_metrics(eval_pred)` function suitable for
+            `Seq2SeqTrainer`.
+    """
     def compute_metrics(eval_pred):
+        """Decode generated and target sequences and score them as labels.
+
+        Args:
+            eval_pred: `(predictions, labels)` tuple from `Seq2SeqTrainer`
+                (token ids, with -100 marking padding in `labels`).
+
+        Returns:
+            dict: Accuracy, macro/weighted F1, precision, and recall,
+                computed after mapping decoded text back to label ids
+                (defaulting unrecognized text to the "positive" class).
+        """
         predictions, labels = eval_pred
         if isinstance(predictions, tuple):
             predictions = predictions[0]
@@ -149,6 +215,12 @@ def build_compute_metrics(tokenizer):
 
 
 def main():
+    """Run the full encoder-decoder text-to-text classification SFT pipeline.
+
+    Parses CLI args, loads the tokenizer/dataset/model, either prints a debug
+    batch and exits or trains with `Seq2SeqTrainer`, evaluates, saves the
+    model, and writes a `run_result.json`.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Text classification SFT -- encoder-decoder (text-to-text)")

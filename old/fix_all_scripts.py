@@ -20,7 +20,14 @@ SCRIPTS_TO_FIX = [
 ]
 
 def fix_script(filepath):
-    """Apply all necessary fixes to a script."""
+    """Apply collator/tensor-wrapping compatibility fixes to a script in place, rewriting the file if changed.
+
+    Args:
+        filepath (str): path to the script to patch.
+
+    Returns:
+        bool: True if the file's content was modified and rewritten to disk, False otherwise.
+    """
     with open(filepath, 'r') as f:
         content = f.read()
     
@@ -76,6 +83,7 @@ def fix_script(filepath):
         return False
 
 def main():
+    """Run `fix_script` over every script in `SCRIPTS_TO_FIX` and print a summary of how many were changed."""
     print("="*60)
     print("Fixing fine-tuning scripts...")
     print("="*60)

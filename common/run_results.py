@@ -38,6 +38,39 @@ def write_run_result(
     save_strategy: Optional[str] = None,
     timestamp: Optional[str] = None,
 ) -> str:
+    """Write a run's results to a standardized `run_result.json` file.
+
+    Args:
+        output_dir (str): Directory to write `run_result.json` into (created
+            if missing).
+        stage (str): Pipeline stage that produced this run (e.g.
+            "pretraining", "supervised-finetuning", "rlhf").
+        task (str): Task name (e.g. "text_classification", "ner").
+        modality (str): Data modality (e.g. "text", "image", "audio").
+        model_name (str): Model checkpoint id/path used for this run.
+        dataset_name (str): Dataset id/path used for this run.
+        hyperparameters (Dict[str, Any]): Free-form hyperparameters used for
+            this run.
+        metrics (Dict[str, Any]): Free-form evaluation/training metrics
+            produced by this run.
+        num_train_samples (int): Number of training samples used.
+        num_eval_samples (int): Number of evaluation samples used.
+        train_runtime_seconds (float): Wall-clock training duration in
+            seconds.
+        architecture (Optional[str]): Architecture family, if applicable
+            (e.g. "decoder-only", "encoder-decoder").
+        variant (Optional[str]): Task variant, if applicable (e.g. "cot",
+            "standard").
+        cot_enabled (Optional[bool]): Whether chain-of-thought was used, if
+            applicable to this stage.
+        save_strategy (Optional[str]): Model save strategy used, if
+            applicable (see `common.model_saving`).
+        timestamp (Optional[str]): ISO-8601 timestamp to record; defaults to
+            the current UTC time if not given.
+
+    Returns:
+        str: The path to the written `run_result.json` file.
+    """
     record = {
         "stage": stage,
         "task": task,

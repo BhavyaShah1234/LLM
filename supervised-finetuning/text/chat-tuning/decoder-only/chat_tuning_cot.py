@@ -51,6 +51,12 @@ MAX_RAW_EXAMPLES = 10000  # dataset is large; cap the streamed materialization
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model/quantization/LoRA,
+        optimization, data-selection, output, and debug flags.
+    """
     p = argparse.ArgumentParser(description="SFT a decoder-only model for chat tuning (with CoT).")
 
     p.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B-Base", help="Base checkpoint. Default: Qwen/Qwen3-1.7B-Base.")
@@ -90,6 +96,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def extract_exchange(conversations):
+    """Pull the first human/gpt turn pair out of a ShareGPT-style conversation.
+
+    Args:
+        conversations: List of turn dicts with `from` (`"human"`/`"gpt"`)
+            and `value` keys.
+
+    Returns:
+        tuple or None: `(user_msg, asst_msg)` for the first complete
+        human/gpt exchange, or `None` if the conversation never produces
+        both a human and a gpt turn.
+    """
     user_msg, asst_msg = "", ""
     for turn in conversations:
         role = turn.get("from")
@@ -105,15 +122,48 @@ def extract_exchange(conversations):
 
 
 class ChatCoTDataset(Dataset):
+    """Torch dataset that formats extracted exchanges into CoT-wrapped chat prompts.
+
+    Each item is tokenized, with the prompt span masked out of `labels` so
+    loss is only computed on the assistant's response (which already embeds
+    its own `<think>...</think>` reasoning text).
+
+    Attributes:
+        rows: List of `(user_msg, asst_msg)` tuples.
+        tokenizer: The model's tokenizer.
+        max_length: Max token length for truncation.
+    """
+
     def __init__(self, rows, tokenizer, max_length: int):
+        """Initialize the dataset.
+
+        Args:
+            rows: List of `(user_msg, asst_msg)` tuples.
+            tokenizer: The model's tokenizer.
+            max_length (int): Max token length for truncation.
+        """
         self.rows = rows
         self.tokenizer = tokenizer
         self.max_length = max_length
 
     def __len__(self):
+        """Return the number of rows in the dataset.
+
+        Returns:
+            int: Number of rows.
+        """
         return len(self.rows)
 
     def __getitem__(self, idx):
+        """Build the tokenized, label-masked training example for one row.
+
+        Args:
+            idx: Index of the row to fetch.
+
+        Returns:
+            dict: `input_ids`, `attention_mask`, and `labels` (prompt span
+            set to -100) for the example.
+        """
         user_msg, asst_msg = self.rows[idx]
         prompt = f"SYSTEM: {SYSTEM_MESSAGE}\nUSER: {user_msg}\nASSISTANT: "
         full_text = prompt + asst_msg  # asst_msg already contains <think>...</think>
@@ -130,6 +180,16 @@ class ChatCoTDataset(Dataset):
 
 
 def verify_dataset() -> None:
+    """Stream one example from DATASET_NAME and sanity-check its fields.
+
+    Asserts that a `conversations` field is present and that an exchange
+    can be extracted from it, and prints a preview. Not called from
+    `main()` by default (see the comment there) but kept for manual
+    verification.
+
+    Raises:
+        AssertionError: If the `conversations` field is missing.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -144,6 +204,20 @@ def verify_dataset() -> None:
 
 
 def load_and_prepare_data(args, tokenizer):
+    """Stream, extract, split, and subsample exchanges into train/eval sets.
+
+    Args:
+        args: Parsed CLI namespace; uses `max_samples`, `sample_selection`,
+            `max_eval_samples`, and `seed`.
+        tokenizer: The model's tokenizer, passed through to the returned
+            datasets.
+
+    Returns:
+        tuple: `(train_dataset, eval_dataset, eval_rows)` where the first
+        two are `ChatCoTDataset` instances and `eval_rows` is the raw list
+        of eval-split `(user_msg, asst_msg)` tuples (used later for
+        generation-based evaluation).
+    """
     print_banner("LOADING DATASET")
     raw = load_dataset(DATASET_NAME, split="train", streaming=True)
     exchanges = []
@@ -176,6 +250,19 @@ def load_and_prepare_data(args, tokenizer):
 
 
 def decode_example(example, index, tokenizer):
+    """Decode one tokenized example into a human-readable debug string.
+
+    Args:
+        example: A tokenized example dict as returned by
+            `ChatCoTDataset.__getitem__`.
+        index: The example's index (unused, kept for a uniform
+            `decode_fn` signature with `common.logging_utils.print_formatted_examples`).
+        tokenizer: The model's tokenizer, used to decode token ids.
+
+    Returns:
+        str: Formatted preview of the full text and the loss-bearing
+        assistant response.
+    """
     input_ids = example["input_ids"]
     labels = example["labels"]
     full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
@@ -185,6 +272,20 @@ def decode_example(example, index, tokenizer):
 
 
 def evaluate_model(model, tokenizer, eval_rows, args):
+    """Generate assistant responses for the eval set and score them.
+
+    Args:
+        model: The trained (or base) causal LM to generate from.
+        tokenizer: The model's tokenizer, used to build prompts and decode
+            generations.
+        eval_rows: Raw `(user_msg, asst_msg)` tuples (as returned by
+            `load_and_prepare_data`) to evaluate on.
+        args: Parsed CLI namespace; uses `max_length`.
+
+    Returns:
+        dict: `rouge_l`, `bertscore_f1` (or None if scoring failed),
+        `cot_enabled`, `cot_usage_rate`, and `avg_cot_length_words`.
+    """
     print_banner("EVALUATION")
     model.eval()
     predictions, references, cot_outputs = [], [], []
@@ -234,6 +335,13 @@ def evaluate_model(model, tokenizer, eval_rows, args):
 
 
 def main():
+    """Run the full CoT chat-tuning SFT pipeline: load, train, evaluate, save, record.
+
+    Parses CLI args, loads and preprocesses the dataset, loads the base
+    causal LM (optionally quantized/LoRA-adapted), either dumps formatted
+    debug examples and exits or trains via `Trainer`, evaluates the result,
+    saves the model, and writes a `run_result.json`.
+    """
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Chat tuning SFT -- decoder-only, with CoT")
