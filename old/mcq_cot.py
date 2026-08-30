@@ -79,7 +79,11 @@ class MCQCoTDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
     def __len__(self):
-        """Return the number of examples in the dataset."""
+        """Return the number of examples in the dataset.
+
+        Returns:
+            int: Number of examples.
+        """
         return len(self.data)
     def __getitem__(self, idx):
         """Tokenize example `idx` into a `<think>` CoT + answer-letter prompt, masking the prompt in labels with -100.
@@ -118,6 +122,19 @@ def load_and_prepare_data(args):
     print("\nLoading dataset: HPAI-BSC/medmcqa-cot-llama31 (WITH CoT)")
     dataset = load_dataset("HPAI-BSC/medmcqa-cot-llama31")
     def format_example(ex):
+        """Parse the answer letter and reasoning trace out of a raw MCQ response.
+
+        Args:
+            ex (dict): Raw dataset example with `question`, `options`, and
+                a free-text `response` containing "Answer: <letter>" plus
+                an optional `<think>` reasoning block.
+
+        Returns:
+            dict: `{"question", "options", "reasoning", "answer"}`, with
+            `answer` parsed from `response` (defaults to "A" if not found)
+            and `reasoning` the response text with the answer line and
+            `<think>` tags stripped, capped to 500 chars.
+        """
         response = ex.get("response", "")
         answer_match = re.search(r'Answer:\s*([A-D])', response, re.IGNORECASE)
         answer = answer_match.group(1).upper() if answer_match else "A"

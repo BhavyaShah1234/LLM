@@ -215,6 +215,19 @@ def load_and_prepare_data(args):
     dataset = load_dataset("domofon/fake_news_cot_reasoning")
     
     def format_example(example):
+        """Normalize a raw fake/real-news example's text, reasoning, and label.
+
+        Args:
+            example (dict): Raw dataset example with a text field (`text`
+                or `news_text`), a reasoning field (`reasoning` or
+                `explanation`), and a label field (`label` or `class`).
+
+        Returns:
+            dict: `{"text", "reasoning", "label"}`, with `text` capped to
+            1500 chars, `reasoning` capped to 500 chars (defaulted to a
+            generic sentence if empty), and `label` standardized to
+            "fake"/"real".
+        """
         # Extract text, reasoning, and label
         text = example.get("text", example.get("news_text", ""))
         reasoning = example.get("reasoning", example.get("explanation", ""))

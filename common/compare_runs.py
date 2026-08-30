@@ -82,6 +82,15 @@ def print_comparison_table(
             col_widths[i] = max(col_widths[i], len(cell))
 
     def fmt_row(cells):
+        """Render one row as fixed-width, pipe-separated cells.
+
+        Args:
+            cells: Row values to format, aligned with `col_widths`.
+
+        Returns:
+            str: The row rendered as `"cell1 | cell2 | ..."`, each cell
+            left-justified to its column's width.
+        """
         return " | ".join(str(c).ljust(w) for c, w in zip(cells, col_widths))
 
     print(fmt_row(header_cells))

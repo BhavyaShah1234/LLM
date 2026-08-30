@@ -182,7 +182,15 @@ def load_and_prepare_data(args, feature_extractor):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def transform(examples):
-        """Batch-transform raw audio examples into model-ready features and labels."""
+        """Batch-transform raw audio examples into model-ready features and labels.
+
+        Args:
+            examples (dict): Batch with `audio` (raw audio samples) and
+                `target` (integer class label) columns.
+
+        Returns:
+            dict: `{"input_values", "labels"}` ready for the model.
+        """
         waveforms = [waveform_to_16k_mono(audio) for audio in examples["audio"]]
         encoding = feature_extractor(waveforms, sampling_rate=TARGET_SAMPLE_RATE, return_tensors="pt")
         return {"input_values": encoding["input_values"], "labels": examples["target"]}

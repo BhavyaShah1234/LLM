@@ -176,7 +176,16 @@ def load_and_prepare_data(args):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def to_prompt_dataset(examples):
-        """Map a batch of raw MedMCQA rows to {"prompt", "answer"} columns."""
+        """Map a batch of raw MedMCQA rows to {"prompt", "answer"} columns.
+
+        Args:
+            examples (dict): Batch with `Question`, `Option_A`-`Option_D`,
+                and `Label` columns.
+
+        Returns:
+            dict: `{"prompt", "answer"}` — one formatted prompt and ground-truth
+            answer letter per input row.
+        """
         return {
             "prompt": [build_prompt({"Question": q, "Option_A": a, "Option_B": b, "Option_C": c, "Option_D": d}) for q, a, b, c, d in zip(examples["Question"], examples["Option_A"], examples["Option_B"], examples["Option_C"], examples["Option_D"])],
             "answer": examples["Label"],

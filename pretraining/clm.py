@@ -114,14 +114,30 @@ def tokenize_and_pack(dataset, tokenizer, block_size: int, desc: str):
         blocks, with any trailing tokens shorter than block_size dropped.
     """
     def tokenize_fn(examples):
-        """Tokenize a batch of stories, appending EOS to each."""
+        """Append EOS to each story and tokenize the batch.
+
+        Args:
+            examples (dict): Batch with a `text` column.
+
+        Returns:
+            dict: Tokenizer output (`input_ids`, `attention_mask`, ...).
+        """
         texts_with_eos = [t + tokenizer.eos_token for t in examples["text"]]
         return tokenizer(texts_with_eos)
 
     tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=dataset.column_names, desc=f"Tokenizing ({desc})")
 
     def group_texts(examples):
-        """Concatenate a tokenized batch and split it into block_size chunks."""
+        """Concatenate all tokenized examples in the batch and split into fixed blocks.
+
+        Args:
+            examples (dict): Batch of tokenizer output columns.
+
+        Returns:
+            dict: Same columns rechunked to `block_size`, plus `labels` (a
+            copy of `input_ids`); any remainder shorter than `block_size`
+            is dropped.
+        """
         concatenated = {k: sum(examples[k], []) for k in examples.keys()}
         total_length = (len(concatenated["input_ids"]) // block_size) * block_size
         result = {

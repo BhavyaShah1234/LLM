@@ -112,13 +112,29 @@ def tokenize_and_pack(dataset, tokenizer, block_size: int, desc: str):
         any trailing tokens shorter than block_size dropped.
     """
     def tokenize_fn(examples):
-        """Tokenize a batch of stories without adding special tokens."""
+        """Tokenize a batch of stories without adding special tokens.
+
+        Args:
+            examples (dict): Batch with a `text` column.
+
+        Returns:
+            dict: Tokenizer output (`input_ids`, `attention_mask`, ...).
+        """
         return tokenizer(examples["text"], add_special_tokens=False)
 
     tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=dataset.column_names, desc=f"Tokenizing ({desc})")
 
     def group_texts(examples):
-        """Concatenate a tokenized batch and split it into block_size chunks."""
+        """Concatenate all tokenized `input_ids` in the batch and split into fixed blocks.
+
+        Args:
+            examples (dict): Batch of tokenizer output; only `input_ids` is used.
+
+        Returns:
+            dict: `{"input_ids"}` rechunked to `block_size`; any remainder
+            shorter than `block_size` is dropped. Span corruption itself
+            happens later, per-example, in `corrupt`.
+        """
         concatenated = sum(examples["input_ids"], [])
         total_length = (len(concatenated) // block_size) * block_size
         return {"input_ids": [concatenated[i : i + block_size] for i in range(0, total_length, block_size)]}
@@ -251,7 +267,15 @@ def load_and_prepare_data(args, tokenizer):
     rng = np.random.default_rng(args.seed)
 
     def corrupt(example):
-        """Apply span corruption to one packed block, returning encoder/target ids."""
+        """Apply span corruption to one packed block, returning encoder/target ids.
+
+        Args:
+            example (dict): One packed block with an `input_ids` list.
+
+        Returns:
+            dict: `{"input_ids", "labels"}` — the noised encoder input and
+            the target sequence of corrupted spans, per `apply_span_corruption`.
+        """
         enc, tgt = apply_span_corruption(example["input_ids"], tokenizer, args.noise_density, args.mean_noise_span_length, rng)
         return {"input_ids": enc, "labels": tgt}
 

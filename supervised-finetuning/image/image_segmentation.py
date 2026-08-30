@@ -149,7 +149,15 @@ def load_and_prepare_data(args, processor):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def transform(examples):
-        """Batch-transform raw images and masks into model-ready pixel values and labels."""
+        """Batch-transform raw images and masks into model-ready pixel values and labels.
+
+        Args:
+            examples (dict): Batch with `image` (list of PIL images) and
+                `mask` (list of PIL segmentation masks) columns.
+
+        Returns:
+            dict: `{"pixel_values", "labels"}` ready for the model.
+        """
         images = [img.convert("RGB") for img in examples["image"]]
         masks = [mask.convert("L") for mask in examples["mask"]]
         encoding = processor(images=images, segmentation_maps=masks, return_tensors="pt")

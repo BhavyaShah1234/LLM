@@ -149,7 +149,16 @@ def load_and_prepare_data(args, processor):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def transform(examples):
-        """Batch-transform raw images and COCO annotations into model-ready pixel values and labels."""
+        """Batch-transform raw images and COCO annotations into model-ready pixel values and labels.
+
+        Args:
+            examples (dict): Batch of raw dataset columns, including
+                `image` (list of PIL images) plus the detection-annotation
+                columns consumed by `to_coco_annotations`.
+
+        Returns:
+            dict: `{"pixel_values", "labels"}` ready for the model.
+        """
         images = [img.convert("RGB") for img in examples["image"]]
         targets = [to_coco_annotations(dict(zip(examples.keys(), vals))) for vals in zip(*examples.values())]
         encoding = processor(images=images, annotations=targets, return_tensors="pt")

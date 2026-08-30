@@ -64,7 +64,11 @@ class ChatDS(Dataset):
         """
         self.data,self.tok,self.ml=d,tok,ml
     def __len__(self):
-        """Return the number of examples in the dataset."""
+        """Return the number of examples in the dataset.
+
+        Returns:
+            int: Number of examples.
+        """
         return len(self.data)
     def __getitem__(self,i):
         """Tokenize example `i` and mask prompt tokens in the labels with -100.
@@ -100,6 +104,16 @@ def load_data(a):
     print("\\nLoading: devrev-research/MathChatSync-reasoning")
     ds=load_dataset("devrev-research/MathChatSync-reasoning")
     def fmt(e):
+        """Build a system/user/assistant prompt-response pair from a raw chat example.
+
+        Args:
+            e (dict): Raw dataset example with a user turn (`user` or
+                `question`) and an assistant turn (`assistant` or `response`).
+
+        Returns:
+            dict: `{"prompt", "response"}`, with `prompt` wrapping the user
+            turn in the fixed system/user/assistant template.
+        """
         user=e.get("user",e.get("question",""))
         asst=e.get("assistant",e.get("response",""))
         pr="SYSTEM: You are a helpful AI assistant.\\nUSER: "+user+"\\nASSISTANT: "

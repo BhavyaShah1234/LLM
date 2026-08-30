@@ -74,7 +74,7 @@ def build_prompt(row) -> str:
         row: Dataset row with `Question`, `Option_A`-`Option_D`.
 
     Returns:
-        str: Full prompt text ending at `### Response:\n`, ready for generation.
+        str: Full prompt text ending right after the "### Response:" header, ready for generation.
     """
     return f"### Instruction:\n{INSTRUCTION}\n\n### Input:\n{format_question(row)}\n\n### Response:\n"
 

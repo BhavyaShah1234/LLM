@@ -117,7 +117,15 @@ def load_and_prepare_data(args, processor):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def transform(examples):
-        """Batch-transform raw PIL images into normalized pixel values and labels."""
+        """Batch-transform raw PIL images into normalized pixel values and labels.
+
+        Args:
+            examples (dict): Batch with `img` (list of PIL images) and
+                `label` (integer class label) columns.
+
+        Returns:
+            dict: `{"pixel_values", "labels"}` ready for the model.
+        """
         pixel_values = processor([img.convert("RGB") for img in examples["img"]], return_tensors="pt")["pixel_values"]
         return {"pixel_values": pixel_values, "labels": examples["label"]}
 

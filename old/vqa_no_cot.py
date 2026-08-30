@@ -122,6 +122,16 @@ def load_data(a):
     print("\\nLoading: opendatalab/ChartVerse-SFT-1.8M (NO CoT)")
     ds=load_dataset("opendatalab/ChartVerse-SFT-1.8M",split="train",streaming=True)
     def fmt(e):
+        """Normalize a raw VQA example's question, answer, and image fields.
+
+        Args:
+            e (dict): Raw dataset example with a question field (`query` or
+                `question`), an answer field (`answer` or `response`), and
+                an image field (`image` or `chart`).
+
+        Returns:
+            dict: `{"question", "answer", "image"}`.
+        """
         q=e.get("query",e.get("question",""))
         a=e.get("answer",e.get("response",""))
         img=e.get("image",e.get("chart",None))

@@ -207,6 +207,17 @@ def load_and_prepare_data(args):
     dataset = load_dataset("domofon/fake_news_cot_reasoning")
     
     def format_example(example):
+        """Extract text and a standardized label, ignoring any reasoning/CoT field.
+
+        Args:
+            example (dict): Raw dataset example with a text field (`input`,
+                `text`, or `news_text`) and a label field (`status`,
+                `label`, or `class`).
+
+        Returns:
+            dict: `{"text", "label"}`, with `text` capped to 2000 chars and
+            `label` standardized to "fake"/"real".
+        """
         # Extract only the final label, ignore reasoning/CoT
         # Dataset fields: title, input, reasoning, status
         text = example.get("input", example.get("text", example.get("news_text", "")))

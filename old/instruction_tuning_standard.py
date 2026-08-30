@@ -76,7 +76,11 @@ class InstructionDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
     def __len__(self):
-        """Return the number of examples in the dataset."""
+        """Return the number of examples in the dataset.
+
+        Returns:
+            int: Number of examples.
+        """
         return len(self.data)
     def __getitem__(self, idx):
         """Tokenize example `idx` into an Alpaca-style prompt + output, masking the prompt in labels with -100.
@@ -112,6 +116,17 @@ def load_and_prepare_data(args):
     print("\nLoading dataset: ibivibiv/math_instruct")
     dataset = load_dataset("ibivibiv/math_instruct")
     def format_example(ex):
+        """Attach a random system instruction to a raw instruction/output pair.
+
+        Args:
+            ex (dict): Raw dataset example with an instruction field
+                (`instruction` or `query`) and an output field (`output`
+                or `response`).
+
+        Returns:
+            dict: `{"instruction", "input", "output"}`, with `instruction`
+            drawn from `SYSTEM_INSTRUCTIONS`.
+        """
         instruction = random.choice(SYSTEM_INSTRUCTIONS)
         input_text = ex.get("instruction", ex.get("query", ""))
         output_text = ex.get("output", ex.get("response", ""))

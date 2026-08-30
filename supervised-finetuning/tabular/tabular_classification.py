@@ -164,7 +164,11 @@ class TabularDataset(Dataset):
         self.target_map = target_map
 
     def __len__(self):
-        """Return the number of rows in the dataset."""
+        """Return the number of rows in the dataset.
+
+        Returns:
+            int: Number of rows.
+        """
         return len(self.rows)
 
     def __getitem__(self, idx):

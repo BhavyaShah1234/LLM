@@ -77,7 +77,11 @@ class InstructionNoCoTDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
     def __len__(self):
-        """Return the number of examples in the dataset."""
+        """Return the number of examples in the dataset.
+
+        Returns:
+            int: Number of examples.
+        """
         return len(self.data)
     def __getitem__(self, idx):
         """Tokenize example `idx` into an Alpaca-style prompt + output, masking the prompt in labels with -100.
@@ -113,6 +117,16 @@ def load_and_prepare_data(args):
     print("\nLoading dataset: domofon/evol-instruct-code-cot-80k (NO CoT)")
     dataset = load_dataset("domofon/evol-instruct-code-cot-80k")
     def format_example(ex):
+        """Attach a random system instruction and strip any `<think>` block from the output.
+
+        Args:
+            ex (dict): Raw dataset example with `instruction` and `output`.
+
+        Returns:
+            dict: `{"instruction", "input", "output"}`, with `instruction`
+            drawn from `SYSTEM_INSTRUCTIONS` and `output` stripped of any
+            `<think>...</think>` reasoning trace.
+        """
         instruction = random.choice(SYSTEM_INSTRUCTIONS)
         input_text = ex.get("instruction", "")
         output_text = ex.get("output", "")

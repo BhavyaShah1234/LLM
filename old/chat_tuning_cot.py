@@ -64,7 +64,11 @@ class ChatCoTDS(Dataset):
         """
         self.data,self.tok,self.ml=d,tok,ml
     def __len__(self):
-        """Return the number of examples in the dataset."""
+        """Return the number of examples in the dataset.
+
+        Returns:
+            int: Number of examples.
+        """
         return len(self.data)
     def __getitem__(self,i):
         """Tokenize example `i` and mask prompt tokens in the labels with -100.
@@ -100,6 +104,18 @@ def load_data(a):
     print("\\nLoading: PJMixers-Dev/oumi-ai_lmsys_chat_1m_clean_R1-1k-think-1k-response-ShareGPT (WITH CoT)")
     ds=load_dataset("PJMixers-Dev/oumi-ai_lmsys_chat_1m_clean_R1-1k-think-1k-response-ShareGPT")
     def fmt(e):
+        """Extract a human/gpt exchange from a ShareGPT-style conversation example.
+
+        Args:
+            e (dict): Raw dataset example with a `conversations` list of
+                `{"from", "value"}` turns.
+
+        Returns:
+            dict or None: `{"prompt", "response"}` built from the first
+            human/gpt turn pair, wrapped in the fixed system/user/assistant
+            template; `None` if the example has fewer than 2 turns or is
+            missing either a human or gpt turn.
+        """
         convs=e.get("conversations",[])
         if len(convs)<2:return None
         user_msg,asst_msg="",""

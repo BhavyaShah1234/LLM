@@ -66,7 +66,11 @@ class DS(Dataset):
         """
         self.data,self.tok,self.ml=d,tok,ml
     def __len__(self):
-        """Return the number of examples in the dataset."""
+        """Return the number of examples in the dataset.
+
+        Returns:
+            int: Number of examples.
+        """
         return len(self.data)
     def __getitem__(self,i):
         """Tokenize example `i` into an Alpaca-style prompt + `<think>` CoT + output, masking the prompt in labels with -100.
@@ -102,6 +106,18 @@ def load_data(a):
     print("\\nLoading: domofon/evol-instruct-code-cot-80k (WITH CoT)")
     ds=load_dataset("domofon/evol-instruct-code-cot-80k")
     def fmt(e):
+        """Attach a random system instruction and reasoning trace to a raw example.
+
+        Args:
+            e (dict): Raw dataset example with `instruction`, `output`, and
+                an optional `thinking` field.
+
+        Returns:
+            dict: `{"instruction", "input", "think", "output"}`, with
+            `instruction` drawn from `SYS_INSTR` and `think` the (capped
+            to 500 chars) `thinking` field, defaulted to a generic sentence
+            if empty.
+        """
         inst=random.choice(SYS_INSTR)
         inp=e.get("instruction","")
         out=e.get("output","")

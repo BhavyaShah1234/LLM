@@ -219,6 +219,16 @@ def load_and_prepare_data(args):
     label_map = {0: "negative", 1: "positive"}
     
     def format_example(example):
+        """Map a raw example's integer label to its class name via `label_map`.
+
+        Args:
+            example (dict): Raw dataset example with `sentence` and `label`
+                (integer class index).
+
+        Returns:
+            dict: `{"sentence", "label"}` with `label` replaced by the
+            class name string.
+        """
         return {
             "sentence": example["sentence"],
             "label": label_map[example["label"]]

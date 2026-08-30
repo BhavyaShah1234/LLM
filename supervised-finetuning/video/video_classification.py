@@ -199,7 +199,15 @@ def load_and_prepare_data(args, processor, num_frames: int):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def transform(examples):
-        """Sample and preprocess frames for a batch of examples (lazy, per-access)."""
+        """Sample and preprocess frames for a batch of examples (lazy, per-access).
+
+        Args:
+            examples (dict): Batch with `video` (list of video file paths)
+                and `label` (integer class label) columns.
+
+        Returns:
+            dict: `{"pixel_values", "labels"}` ready for the model.
+        """
         pixel_values = []
         for video in examples["video"]:
             frames = sample_frames(video, num_frames)
