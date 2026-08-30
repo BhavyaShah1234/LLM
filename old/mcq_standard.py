@@ -26,6 +26,12 @@ warnings.filterwarnings("ignore")
 
 
 def parse_args():
+    """Parse CLI arguments for the standard MCQ fine-tuning run.
+
+    Returns:
+        argparse.Namespace: Parsed arguments covering model choice, quantization/LoRA
+        setup, optimization hyperparameters, and I/O paths.
+    """
     parser = argparse.ArgumentParser(description="Fine-tune Qwen for MCQ")
     parser.add_argument("--model", type=str, required=True,
                         choices=["Qwen/Qwen3-4B-Base", "Qwen/Qwen3-4B", 
@@ -59,15 +65,45 @@ def parse_args():
 
 
 class MCQDataset(Dataset):
+    """Torch dataset that formats MCQ examples as instruction/response pairs
+    with loss masked to the answer letter only.
+
+    Attributes:
+        data (List[Dict]): Formatted examples, each with question, options, and answer.
+        tokenizer: Tokenizer used to encode prompt and full text.
+        max_length (int): Max token length for the encoded example.
+    """
+
     def __init__(self, data: List[Dict], tokenizer, max_length: int):
+        """Store the formatted examples and tokenization settings.
+
+        Args:
+            data (List[Dict]): Formatted MCQ examples.
+            tokenizer: Tokenizer used to encode prompt and full text.
+            max_length (int): Max token length for the encoded example.
+        """
         self.data = data
         self.tokenizer = tokenizer
         self.max_length = max_length
-        
+
     def __len__(self):
+        """Return the number of examples in the dataset.
+
+        Returns:
+            int: Number of examples.
+        """
         return len(self.data)
-    
+
     def __getitem__(self, idx):
+        """Build the tokenized, label-masked training example at `idx`.
+
+        Args:
+            idx (int): Index into `self.data`.
+
+        Returns:
+            dict: `input_ids`, `attention_mask`, and `labels` (prompt tokens masked
+            to -100 so loss is computed on the answer letter only).
+        """
         item = self.data[idx]
         
         instruction = "Answer the following medical multiple choice question by selecting the correct option (A, B, C, or D)."
@@ -96,13 +132,33 @@ class MCQDataset(Dataset):
 
 
 def load_and_prepare_data(args):
+    """Load the araag2/MedMCQA dataset and reformat it for training/eval.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `max_samples` to optionally
+            cap the number of train/test examples.
+
+    Returns:
+        tuple[list[dict], list[dict]]: `(train_data, test_data)`, each a list of
+        dicts with `question`, `opa`-`opd`, and `answer` (letter).
+    """
     print("\n" + "="*80)
     print("LOADING DATASET")
     print("="*80)
-    
+
     dataset = load_dataset("araag2/MedMCQA", "processed")
-    
+
     def format_example(example):
+        """Map a raw MedMCQA example's numeric answer index to a letter.
+
+        Args:
+            example (dict): Raw dataset example with `question`, `opa`-`opd`,
+                and `cop`/`answer` (0-3 index).
+
+        Returns:
+            dict: `{"question", "opa", "opb", "opc", "opd", "answer"}` with
+            `answer` converted to a letter (A-D).
+        """
         # Map answer index to letter
         answer_idx = example.get("cop", example.get("answer", 0))
         answer_map = {0: "A", 1: "B", 2: "C", 3: "D"}
@@ -146,6 +202,15 @@ def load_and_prepare_data(args):
 
 
 def setup_model_and_tokenizer(args):
+    """Load the tokenizer and base model, applying quantization and optional LoRA.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args controlling model name,
+            quantization, mixed precision, gradient checkpointing, and LoRA config.
+
+    Returns:
+        tuple: `(model, tokenizer)` ready for training.
+    """
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -185,6 +250,13 @@ def setup_model_and_tokenizer(args):
 
 
 def print_examples(train_dataset, tokenizer, num_examples=2):
+    """Print a few decoded training examples for sanity-checking the formatting.
+
+    Args:
+        train_dataset (MCQDataset): Dataset to sample examples from.
+        tokenizer: Tokenizer used to decode `input_ids` back to text.
+        num_examples (int): Number of examples to print. Defaults to 2.
+    """
     print("\n" + "="*80)
     print("FORMATTED EXAMPLES")
     print("="*80)
@@ -197,6 +269,18 @@ def print_examples(train_dataset, tokenizer, num_examples=2):
 
 
 def train_model(model, tokenizer, train_dataset, eval_dataset, args):
+    """Run supervised fine-tuning with `Trainer` and save the resulting model.
+
+    Args:
+        model: Causal LM to fine-tune (optionally LoRA-wrapped).
+        tokenizer: Tokenizer paired with `model`; also saved to `args.output_dir`.
+        train_dataset (MCQDataset): Training split.
+        eval_dataset (MCQDataset): Evaluation split used during training.
+        args (argparse.Namespace): Parsed CLI args supplying all `TrainingArguments`.
+
+    Returns:
+        Trainer: The trainer instance after training completes.
+    """
     training_args = TrainingArguments(
         output_dir=args.output_dir, num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -225,6 +309,19 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, args):
 
 
 def evaluate_model(model, tokenizer, test_data, args):
+    """Greedy-generate an answer letter for each test example and score accuracy/F1.
+
+    Writes the results to `evaluation_results.json` under `args.output_dir`.
+
+    Args:
+        model: Fine-tuned causal LM to evaluate.
+        tokenizer: Tokenizer paired with `model`.
+        test_data (list[dict]): Test examples with `question`, `opa`-`opd`, `answer`.
+        args (argparse.Namespace): Parsed CLI args; uses `max_length` and `output_dir`.
+
+    Returns:
+        dict: `{"accuracy", "f1_macro"}` evaluation results.
+    """
     model.eval()
     predictions = []
     ground_truths = []
@@ -276,6 +373,9 @@ def evaluate_model(model, tokenizer, test_data, args):
 
 
 def main():
+    """Run the end-to-end standard MCQ fine-tuning pipeline: load data, build the
+    model, train, and evaluate (or stop early if `--debug_first_batch` is set).
+    """
     args = parse_args()
     random.seed(args.seed)
     np.random.seed(args.seed)

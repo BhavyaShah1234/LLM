@@ -26,6 +26,12 @@ warnings.filterwarnings("ignore")
 
 
 def parse_args():
+    """Parse CLI arguments for the CoT NER fine-tuning run.
+
+    Returns:
+        argparse.Namespace: Parsed arguments covering model choice, quantization/LoRA
+        setup, optimization hyperparameters, and I/O paths.
+    """
     parser = argparse.ArgumentParser(description="Fine-tune Qwen for NER with CoT")
     parser.add_argument("--model", type=str, required=True,
                         choices=["Qwen/Qwen3-4B-Base", "Qwen/Qwen3-4B", 
@@ -59,15 +65,46 @@ def parse_args():
 
 
 class NERCoTDataset(Dataset):
+    """Torch dataset that formats NER examples as instruction/response pairs with
+    a `<think>...</think>` reasoning trace followed by the extracted entity JSON,
+    with loss computed on both the thinking tokens and the entities.
+
+    Attributes:
+        data (List[Dict]): Formatted examples, each with `text`, `entities`, `think_process`.
+        tokenizer: Tokenizer used to encode prompt and full text.
+        max_length (int): Max token length for the encoded example.
+    """
+
     def __init__(self, data: List[Dict], tokenizer, max_length: int):
+        """Store the formatted examples and tokenization settings.
+
+        Args:
+            data (List[Dict]): Formatted NER examples.
+            tokenizer: Tokenizer used to encode prompt and full text.
+            max_length (int): Max token length for the encoded example.
+        """
         self.data = data
         self.tokenizer = tokenizer
         self.max_length = max_length
-        
+
     def __len__(self):
+        """Return the number of examples in the dataset.
+
+        Returns:
+            int: Number of examples.
+        """
         return len(self.data)
-    
+
     def __getitem__(self, idx):
+        """Build the tokenized, label-masked training example at `idx`.
+
+        Args:
+            idx (int): Index into `self.data`.
+
+        Returns:
+            dict: `input_ids`, `attention_mask`, and `labels` (prompt tokens masked
+            to -100; loss computed on both the `<think>` trace and entity JSON).
+        """
         item = self.data[idx]
         
         instruction = "Extract all relevant spans from the text and provide them with their relevance labels. Think through the reasoning process."
@@ -97,13 +134,35 @@ class NERCoTDataset(Dataset):
 
 
 def load_and_prepare_data(args):
+    """Load the zilliz context-relevance-with-think dataset and reformat it into
+    text/entities/think_process examples for CoT NER training.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `max_samples` to optionally
+            cap the number of train/test examples.
+
+    Returns:
+        tuple[list[dict], list[dict]]: `(train_data, test_data)`, each a list of
+        `{"text", "entities", "think_process"}` dicts.
+    """
     print("\n" + "="*80)
     print("LOADING DATASET")
     print("="*80)
-    
+
     dataset = load_dataset("zilliz/natural_questions-context-relevance-with-think")
-    
+
     def format_example(example):
+        """Extract a short text span, its labeled entities, and a reasoning trace.
+
+        Args:
+            example (dict): Raw dataset example with `texts`, `context_spans`,
+                `context_spans_relevance`, and `think_process`.
+
+        Returns:
+            dict: `{"text", "entities", "think_process"}` — entities are span/label
+            pairs decoded from character offsets, capped to the first 10; the
+            think process falls back to a generic sentence if empty.
+        """
         texts = example.get("texts", "")
         # Handle if texts is a list
         if isinstance(texts, list):
@@ -163,6 +222,15 @@ def load_and_prepare_data(args):
 
 
 def setup_model_and_tokenizer(args):
+    """Load the tokenizer and base model, applying quantization and optional LoRA.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args controlling model name,
+            quantization, mixed precision, gradient checkpointing, and LoRA config.
+
+    Returns:
+        tuple: `(model, tokenizer)` ready for training.
+    """
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -202,6 +270,13 @@ def setup_model_and_tokenizer(args):
 
 
 def print_examples(train_dataset, tokenizer, num_examples=2):
+    """Print a few decoded training examples for sanity-checking the formatting.
+
+    Args:
+        train_dataset (NERCoTDataset): Dataset to sample examples from.
+        tokenizer: Tokenizer used to decode `input_ids` back to text.
+        num_examples (int): Number of examples to print. Defaults to 2.
+    """
     print("\n" + "="*80)
     print("FORMATTED EXAMPLES (WITH CoT)")
     print("="*80)
@@ -214,6 +289,18 @@ def print_examples(train_dataset, tokenizer, num_examples=2):
 
 
 def train_model(model, tokenizer, train_dataset, eval_dataset, args):
+    """Run supervised fine-tuning with `Trainer` and save the resulting model.
+
+    Args:
+        model: Causal LM to fine-tune (optionally LoRA-wrapped).
+        tokenizer: Tokenizer paired with `model`; also saved to `args.output_dir`.
+        train_dataset (NERCoTDataset): Training split.
+        eval_dataset (NERCoTDataset): Evaluation split used during training.
+        args (argparse.Namespace): Parsed CLI args supplying all `TrainingArguments`.
+
+    Returns:
+        Trainer: The trainer instance after training completes.
+    """
     training_args = TrainingArguments(
         output_dir=args.output_dir, num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -242,6 +329,21 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, args):
 
 
 def evaluate_model(model, tokenizer, test_data, args):
+    """Generate entity predictions (with CoT) for up to 100 test examples and
+    score span/label-set precision, recall, and F1; also tracks CoT usage rate.
+
+    Writes the results to `evaluation_results.json` under `args.output_dir`.
+
+    Args:
+        model: Fine-tuned causal LM to evaluate.
+        tokenizer: Tokenizer paired with `model`.
+        test_data (list[dict]): Test examples with `text` and `entities`.
+        args (argparse.Namespace): Parsed CLI args; uses `max_length` and `output_dir`.
+
+    Returns:
+        dict: `{"f1", "precision", "recall", "cot_enabled", "cot_usage_rate",
+        "avg_cot_length_words"}` evaluation results.
+    """
     model.eval()
     num_correct = num_pred = num_true = 0
     cot_outputs = []
@@ -309,6 +411,9 @@ def evaluate_model(model, tokenizer, test_data, args):
 
 
 def main():
+    """Run the end-to-end CoT NER fine-tuning pipeline: load data, build the
+    model, train, and evaluate (or stop early if `--debug_first_batch` is set).
+    """
     args = parse_args()
     random.seed(args.seed)
     np.random.seed(args.seed)
