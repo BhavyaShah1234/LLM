@@ -47,6 +47,13 @@ DATASET_ROOT = "./output/.torch_geometric_data"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this training script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering GIN architecture sizing,
+        eval split fraction, optimization hyperparameters, output paths,
+        and debug/seed flags.
+    """
     p = argparse.ArgumentParser(description="Train a from-scratch GIN for graph classification (TUDataset MUTAG).")
 
     p.add_argument("--hidden_dim", type=int, default=64, help="GIN hidden dimension. Default: 64.")
@@ -70,6 +77,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset(dataset) -> None:
+    """Print basic dataset stats (size, class count, node feature dim, one sample graph).
+
+    Args:
+        dataset (torch_geometric.datasets.TUDataset): The loaded MUTAG dataset.
+    """
     print_banner("VERIFYING DATASET")
     print(f"Dataset: TUDataset({DATASET_NAME!r})")
     print(f"Num graphs: {len(dataset)}")
@@ -80,7 +92,27 @@ def verify_dataset(dataset) -> None:
 
 
 class GIN(nn.Module):
+    """A small from-scratch Graph Isomorphism Network for graph-level classification.
+
+    Attributes:
+        convs (nn.ModuleList): Stack of `GINConv` layers, each wrapping a
+            2-layer MLP.
+        dropout (float): Dropout probability applied to the pooled graph
+            embedding before classification.
+        classifier (nn.Linear): Final linear layer mapping the pooled graph
+            embedding to class logits.
+    """
+
     def __init__(self, num_node_features: int, hidden_dim: int, num_layers: int, num_classes: int, dropout: float):
+        """Initialize the GIN layers and classification head.
+
+        Args:
+            num_node_features (int): Dimensionality of each input node's feature vector.
+            hidden_dim (int): Hidden dimension used by every GIN layer and its inner MLP.
+            num_layers (int): Number of stacked `GINConv` layers.
+            num_classes (int): Number of output classes for the final classifier.
+            dropout (float): Dropout probability applied before classification.
+        """
         super().__init__()
         self.convs = nn.ModuleList()
         in_dim = num_node_features
@@ -92,6 +124,16 @@ class GIN(nn.Module):
         self.classifier = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x, edge_index, batch):
+        """Run node-level GIN convolutions, sum-pool to graph level, then classify.
+
+        Args:
+            x (torch.Tensor): Node feature matrix, shape (total_nodes, num_node_features).
+            edge_index (torch.Tensor): Graph connectivity in COO format, shape (2, num_edges).
+            batch (torch.Tensor): Graph-assignment vector mapping each node to its graph index.
+
+        Returns:
+            torch.Tensor: Class logits, shape (num_graphs_in_batch, num_classes).
+        """
         for conv in self.convs:
             x = F.relu(conv(x, edge_index))
         graph_embedding = global_add_pool(x, batch)  # sum-pool node embeddings into one vector per graph
@@ -100,6 +142,11 @@ class GIN(nn.Module):
 
 
 def print_formatted_batch(loader) -> None:
+    """Print one batch's tensor shapes and labels for manual inspection.
+
+    Args:
+        loader (torch_geometric.loader.DataLoader): Loader to pull one batch from.
+    """
     print_banner("FORMATTED EXAMPLE BATCH")
     batch = next(iter(loader))
     print(f"batch.x.shape: {tuple(batch.x.shape)} (total nodes across batch, node feature dim)")
@@ -111,6 +158,17 @@ def print_formatted_batch(loader) -> None:
 
 @torch.no_grad()
 def evaluate(model, loader, device):
+    """Run a full evaluation pass and compute loss/accuracy/F1/precision/recall/AUROC.
+
+    Args:
+        model (GIN): The model to evaluate; toggled to eval mode and back to train mode.
+        loader (torch_geometric.loader.DataLoader): Loader over the eval graphs.
+        device (str): Device to move batches to (e.g. "cuda" or "cpu").
+
+    Returns:
+        dict: Metric name to float value, including `auroc` (`nan` if the
+        eval batch contains only one class).
+    """
     model.eval()
     all_preds, all_labels, all_probs_positive = [], [], []
     total_loss = 0.0
@@ -136,6 +194,7 @@ def evaluate(model, loader, device):
 
 
 def main():
+    """Run the end-to-end graph classification pipeline: load MUTAG, train a from-scratch GIN, evaluate, log results."""
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Graph classification (from-scratch GIN, TUDataset MUTAG)")

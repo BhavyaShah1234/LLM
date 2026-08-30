@@ -45,6 +45,12 @@ CLASS_NAMES = ["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this training script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model choice, optimization
+        hyperparameters, sample selection, output paths, and debug/seed flags.
+    """
     p = argparse.ArgumentParser(description="SFT a vision transformer for image classification (classification head).")
 
     p.add_argument("--model", type=str, default="google/vit-base-patch16-224-in21k", help="Vision transformer base checkpoint. Default: google/vit-base-patch16-224-in21k (fp32 ~330MB, no classification head -- one is added fresh for this task's 10 classes).")
@@ -74,6 +80,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset() -> None:
+    """Stream-peek one example from the dataset and assert the expected fields exist.
+
+    Prints the fields and one sample's image size/label. Not called from
+    `main()` (see the comment there) but kept for manual verification runs.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -86,6 +97,18 @@ def verify_dataset() -> None:
 
 
 def load_and_prepare_data(args, processor):
+    """Load CIFAR-10's train/test splits and wire up on-the-fly pixel preprocessing.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `max_samples`,
+            `sample_selection`, `max_eval_samples`, and `seed`.
+        processor: A Hugging Face `AutoImageProcessor` instance used to turn
+            PIL images into normalized pixel value tensors.
+
+    Returns:
+        tuple: `(train_dataset, eval_dataset)`, `datasets.Dataset` objects
+        with a lazy `with_transform` preprocessing pipeline attached.
+    """
     print_banner("LOADING DATASET")
     train_raw = load_dataset(DATASET_NAME, split="train")
     eval_raw = load_dataset(DATASET_NAME, split="test")
@@ -94,6 +117,7 @@ def load_and_prepare_data(args, processor):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def transform(examples):
+        """Batch-transform raw PIL images into normalized pixel values and labels."""
         pixel_values = processor([img.convert("RGB") for img in examples["img"]], return_tensors="pt")["pixel_values"]
         return {"pixel_values": pixel_values, "labels": examples["label"]}
 
@@ -107,12 +131,27 @@ def load_and_prepare_data(args, processor):
 
 
 def collate_fn(batch):
+    """Stack a list of per-example feature dicts into a batched tensor dict.
+
+    Args:
+        batch (list[dict]): Examples, each with fixed-shape `pixel_values`
+            and an integer `labels` value.
+
+    Returns:
+        dict: `{"pixel_values": Tensor, "labels": Tensor}` batched tensors.
+    """
     pixel_values = torch.stack([item["pixel_values"] for item in batch])
     labels = torch.tensor([item["labels"] for item in batch])
     return {"pixel_values": pixel_values, "labels": labels}
 
 
 def print_formatted_examples_classification(dataset, num_examples: int = 2) -> None:
+    """Print a few dataset examples' pixel shapes and labels for manual inspection.
+
+    Args:
+        dataset: A dataset with `__getitem__` returning transformed examples.
+        num_examples (int): Number of examples to print. Default: 2.
+    """
     print_banner("FORMATTED EXAMPLES")
     for i in range(min(num_examples, len(dataset))):
         example = dataset[i]
@@ -123,6 +162,14 @@ def print_formatted_examples_classification(dataset, num_examples: int = 2) -> N
 
 
 def compute_metrics(eval_pred):
+    """Compute accuracy, macro/weighted F1, precision, and recall for a Trainer eval pass.
+
+    Args:
+        eval_pred (tuple): `(logits, labels)` as passed by `transformers.Trainer`.
+
+    Returns:
+        dict: Metric name to float value.
+    """
     logits, labels = eval_pred
     predictions = np.argmax(logits, axis=-1)
     return {
@@ -135,6 +182,7 @@ def compute_metrics(eval_pred):
 
 
 def main():
+    """Run the end-to-end image classification SFT pipeline: load data, fine-tune ViT, evaluate, save."""
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Image classification SFT (classification head)")

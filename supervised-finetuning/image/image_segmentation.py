@@ -67,6 +67,13 @@ CLASS_NAMES = [
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this training script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model choice, eval split
+        sizing, optimization hyperparameters, sample selection, output
+        paths, and debug/seed flags.
+    """
     p = argparse.ArgumentParser(description="SFT a SegFormer model for semantic segmentation.")
 
     p.add_argument("--model", type=str, default="nvidia/mit-b0", help="SegFormer encoder checkpoint (no segmentation head -- one is trained fresh). Default: nvidia/mit-b0 (fp32 ~14MB, smallest SegFormer variant).")
@@ -97,6 +104,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset() -> None:
+    """Stream-peek one example and assert the mask is a single-channel class-index map.
+
+    Prints the fields and one sample's image size/mask shape/unique values.
+    Not called from `main()` (see the comment there) but kept for manual
+    verification runs.
+
+    Raises:
+        AssertionError: If the mask is not a 2-D single-channel array (would
+            indicate an RGB-palette-encoded mask like `nateraw/pascal-voc-2012`'s).
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -111,6 +128,18 @@ def verify_dataset() -> None:
 
 
 def load_and_prepare_data(args, processor):
+    """Load the dataset, carve out an eval split, and wire up on-the-fly mask/pixel preprocessing.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `eval_fraction`,
+            `seed`, `max_samples`, `sample_selection`, and `max_eval_samples`.
+        processor: A Hugging Face `AutoImageProcessor` instance used to
+            jointly preprocess images and segmentation maps.
+
+    Returns:
+        tuple: `(train_dataset, eval_dataset)`, `datasets.Dataset` objects
+        with a lazy `with_transform` preprocessing pipeline attached.
+    """
     print_banner("LOADING DATASET")
     full = load_dataset(DATASET_NAME, split="train")
     split = full.train_test_split(test_size=args.eval_fraction, seed=args.seed)
@@ -120,6 +149,7 @@ def load_and_prepare_data(args, processor):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def transform(examples):
+        """Batch-transform raw images and masks into model-ready pixel values and labels."""
         images = [img.convert("RGB") for img in examples["image"]]
         masks = [mask.convert("L") for mask in examples["mask"]]
         encoding = processor(images=images, segmentation_maps=masks, return_tensors="pt")
@@ -135,12 +165,27 @@ def load_and_prepare_data(args, processor):
 
 
 def collate_fn(batch):
+    """Stack a list of per-example feature dicts into a batched tensor dict.
+
+    Args:
+        batch (list[dict]): Examples, each with fixed-shape `pixel_values`
+            and a `labels` segmentation map.
+
+    Returns:
+        dict: `{"pixel_values": Tensor, "labels": Tensor}` batched tensors.
+    """
     pixel_values = torch.stack([item["pixel_values"] for item in batch])
     labels = torch.stack([item["labels"] for item in batch])
     return {"pixel_values": pixel_values, "labels": labels}
 
 
 def print_formatted_examples_segmentation(dataset, num_examples: int = 2) -> None:
+    """Print a few dataset examples' tensor shapes and present classes for manual inspection.
+
+    Args:
+        dataset: A dataset with `__getitem__` returning transformed examples.
+        num_examples (int): Number of examples to print. Default: 2.
+    """
     print_banner("FORMATTED EXAMPLES")
     for i in range(min(num_examples, len(dataset))):
         example = dataset[i]
@@ -153,7 +198,18 @@ def print_formatted_examples_segmentation(dataset, num_examples: int = 2) -> Non
 
 
 def compute_mean_iou(logits, labels, num_labels: int):
-    """logits: (N, C, h, w) low-res model output. labels: (N, H, W) full-res class-index masks."""
+    """Upsample low-res segmentation logits and compute per-class mean IoU and pixel accuracy.
+
+    Args:
+        logits (numpy.ndarray): Low-res model output, shape (N, C, h, w).
+        labels (numpy.ndarray): Full-res class-index masks, shape (N, H, W).
+        num_labels (int): Number of segmentation classes.
+
+    Returns:
+        dict: `{"mean_iou": float, "pixel_accuracy": float}`. Classes absent
+        from both predictions and labels in this batch are skipped rather
+        than counted as a meaningless 0/0 IoU.
+    """
     logits_tensor = torch.from_numpy(logits)
     labels_tensor = torch.from_numpy(labels)
     upsampled = F.interpolate(logits_tensor, size=labels_tensor.shape[-2:], mode="bilinear", align_corners=False)
@@ -179,7 +235,23 @@ def compute_mean_iou(logits, labels, num_labels: int):
 
 
 def make_compute_metrics(num_labels: int):
+    """Build a Trainer-compatible `compute_metrics` closure bound to a fixed class count.
+
+    Args:
+        num_labels (int): Number of segmentation classes, closed over by the returned function.
+
+    Returns:
+        Callable: A `compute_metrics(eval_pred)` function suitable for `transformers.Trainer`.
+    """
     def compute_metrics(eval_pred):
+        """Compute mean IoU and pixel accuracy for a Trainer eval pass.
+
+        Args:
+            eval_pred (tuple): `(logits, labels)` as passed by `transformers.Trainer`.
+
+        Returns:
+            dict: `{"mean_iou": float, "pixel_accuracy": float}`.
+        """
         logits, labels = eval_pred
         return compute_mean_iou(logits, labels, num_labels)
 
@@ -187,6 +259,7 @@ def make_compute_metrics(num_labels: int):
 
 
 def main():
+    """Run the end-to-end semantic segmentation SFT pipeline: load data, fine-tune SegFormer, evaluate, save."""
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Semantic segmentation SFT (SegFormer)")

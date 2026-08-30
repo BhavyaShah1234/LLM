@@ -50,6 +50,13 @@ TARGET_COLUMN = "income"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this training script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering MLP architecture sizing,
+        eval split fraction, optimization hyperparameters, sample
+        selection, output paths, and debug/seed flags.
+    """
     p = argparse.ArgumentParser(description="Train a from-scratch entity-embedding MLP for tabular classification.")
 
     p.add_argument("--embedding_dim", type=int, default=16, help="Embedding dimension per categorical column. Default: 16.")
@@ -77,6 +84,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset() -> None:
+    """Stream-peek one example from the dataset and assert the expected fields exist.
+
+    Prints the numeric/categorical column names and a sample target value.
+    Not called from `main()` (see the comment there) but kept for manual
+    verification runs.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -90,9 +103,24 @@ def verify_dataset() -> None:
 
 
 def build_preprocessing(train_raw):
-    """Derive numeric normalization stats and categorical vocabularies from
-    the TRAINING split only (never eval) -- standard practice, avoids
-    leaking eval-set statistics into preprocessing.
+    """Derive numeric normalization stats and categorical vocabularies from the training split only.
+
+    Computed on the TRAINING split only (never eval) -- standard practice,
+    avoids leaking eval-set statistics into preprocessing.
+
+    Args:
+        train_raw: The raw (unselected) training split, indexable by column name.
+
+    Returns:
+        tuple: `(numeric_stats, vocabs, target_map)` where `numeric_stats`
+        maps each numeric column to `(mean, std)`, `vocabs` maps each
+        categorical column to a `{value: index}` map with 0 reserved for
+        unseen values, and `target_map` maps the two target label strings
+        to `{0, 1}`.
+
+    Raises:
+        AssertionError: If the target column has other than exactly two
+            distinct values.
     """
     numeric_stats = {}
     for col in NUMERIC_COLUMNS:
@@ -112,16 +140,42 @@ def build_preprocessing(train_raw):
 
 
 class TabularDataset(Dataset):
+    """A `torch.utils.data.Dataset` that normalizes numeric columns and vocab-indexes categorical columns per row.
+
+    Attributes:
+        rows: The underlying rows (list of dict-like records).
+        numeric_stats (dict): Per-numeric-column `(mean, std)`, from `build_preprocessing`.
+        vocabs (dict): Per-categorical-column `{value: index}` map, from `build_preprocessing`.
+        target_map (dict): `{label string: 0 or 1}` binary target mapping.
+    """
+
     def __init__(self, rows, numeric_stats, vocabs, target_map):
+        """Store the rows and preprocessing artifacts used to featurize them on access.
+
+        Args:
+            rows: The underlying rows (list of dict-like records).
+            numeric_stats (dict): Per-numeric-column `(mean, std)` normalization stats.
+            vocabs (dict): Per-categorical-column `{value: index}` vocabulary.
+            target_map (dict): `{label string: 0 or 1}` binary target mapping.
+        """
         self.rows = rows
         self.numeric_stats = numeric_stats
         self.vocabs = vocabs
         self.target_map = target_map
 
     def __len__(self):
+        """Return the number of rows in the dataset."""
         return len(self.rows)
 
     def __getitem__(self, idx):
+        """Featurize one row into normalized numeric, vocab-indexed categorical, and label tensors.
+
+        Args:
+            idx (int): Row index.
+
+        Returns:
+            dict: `{"numeric": Tensor, "categorical": Tensor, "labels": Tensor}`.
+        """
         row = self.rows[idx]
         numeric = torch.tensor(
             [(row[col] - self.numeric_stats[col][0]) / self.numeric_stats[col][1] for col in NUMERIC_COLUMNS],
@@ -135,7 +189,26 @@ class TabularDataset(Dataset):
 
 
 class EntityEmbeddingMLP(nn.Module):
+    """A from-scratch MLP with learned entity embeddings for each categorical column, concatenated with normalized numeric features.
+
+    Attributes:
+        embeddings (nn.ModuleList): One `nn.Embedding` per categorical column.
+        mlp (nn.Sequential): Feedforward classification head over the
+            concatenated numeric + embedded-categorical feature vector.
+    """
+
     def __init__(self, vocabs, num_numeric: int, embedding_dim: int, hidden_dims: list, dropout: float, num_classes: int):
+        """Build one embedding table per categorical column plus a feedforward classification head.
+
+        Args:
+            vocabs (dict): Per-categorical-column `{value: index}` vocabulary,
+                used to size each embedding table.
+            num_numeric (int): Number of numeric input columns.
+            embedding_dim (int): Embedding dimension shared by every categorical column.
+            hidden_dims (list[int]): Hidden layer sizes for the MLP.
+            dropout (float): Dropout probability applied after each hidden layer.
+            num_classes (int): Number of output classes for the final linear layer.
+        """
         super().__init__()
         self.embeddings = nn.ModuleList([nn.Embedding(len(vocab) + 1, embedding_dim) for vocab in vocabs.values()])
         input_dim = num_numeric + embedding_dim * len(vocabs)
@@ -148,12 +221,28 @@ class EntityEmbeddingMLP(nn.Module):
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, numeric, categorical):
+        """Embed categorical columns, concatenate with numeric features, and classify.
+
+        Args:
+            numeric (torch.Tensor): Normalized numeric features, shape (batch, num_numeric).
+            categorical (torch.Tensor): Vocab-indexed categorical features, shape (batch, num_categorical_columns).
+
+        Returns:
+            torch.Tensor: Class logits, shape (batch, num_classes).
+        """
         embedded = [emb(categorical[:, i]) for i, emb in enumerate(self.embeddings)]
         x = torch.cat([numeric] + embedded, dim=1)
         return self.mlp(x)
 
 
 def print_formatted_examples_tabular(dataset, target_map, num_examples: int = 2) -> None:
+    """Print a few dataset examples' normalized/indexed features and labels for manual inspection.
+
+    Args:
+        dataset: A `TabularDataset`-like object with `__getitem__`.
+        target_map (dict): `{label string: 0 or 1}` mapping, inverted here for display.
+        num_examples (int): Number of examples to print. Default: 2.
+    """
     print_banner("FORMATTED EXAMPLES")
     inv_target_map = {v: k for k, v in target_map.items()}
     for i in range(min(num_examples, len(dataset))):
@@ -167,6 +256,16 @@ def print_formatted_examples_tabular(dataset, target_map, num_examples: int = 2)
 
 @torch.no_grad()
 def evaluate(model, loader, device):
+    """Run a full evaluation pass and compute loss/accuracy/F1/precision/recall/AUROC.
+
+    Args:
+        model (EntityEmbeddingMLP): The model to evaluate; toggled to eval mode and back to train mode.
+        loader (torch.utils.data.DataLoader): Loader over the eval rows.
+        device (str): Device to move batches to (e.g. "cuda" or "cpu").
+
+    Returns:
+        dict: Metric name to float value.
+    """
     model.eval()
     all_preds, all_labels, all_probs_positive = [], [], []
     total_loss = 0.0
@@ -194,6 +293,7 @@ def evaluate(model, loader, device):
 
 
 def main():
+    """Run the end-to-end tabular classification pipeline: load data, train a from-scratch entity-embedding MLP, evaluate, log results."""
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Tabular classification (from-scratch entity-embedding MLP)")

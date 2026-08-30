@@ -78,6 +78,13 @@ TARGET_SAMPLE_RATE = 16000
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this training script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model choice, eval split
+        sizing, optimization hyperparameters, sample selection, output
+        paths, and debug/seed flags.
+    """
     p = argparse.ArgumentParser(description="SFT an Audio Spectrogram Transformer for audio classification.")
 
     p.add_argument("--model", type=str, default="MIT/ast-finetuned-audioset-10-10-0.4593", help="AST checkpoint, AudioSet's 527-class head resized for this task. Default: MIT/ast-finetuned-audioset-10-10-0.4593 (fp32 ~340MB). See module docstring for why this replaced an earlier wav2vec2-base attempt.")
@@ -108,6 +115,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset() -> None:
+    """Stream-peek one example from the dataset and assert the expected fields exist.
+
+    Prints the fields, a sample's category/target/audio shape/sample rate.
+    Not called from `main()` (see the comment there) but kept for manual
+    verification runs.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -122,6 +135,17 @@ def verify_dataset() -> None:
 
 
 def waveform_to_16k_mono(audio_decoder) -> np.ndarray:
+    """Downmix a decoded audio clip to mono and resample it to 16kHz.
+
+    Args:
+        audio_decoder: A `torchcodec`-backed audio decoder object (the
+            `datasets` library's `audio` column value) exposing
+            `get_all_samples()`, which returns an object with `.data`
+            (channels, samples) and `.sample_rate`.
+
+    Returns:
+        numpy.ndarray: 1-D mono waveform resampled to `TARGET_SAMPLE_RATE`.
+    """
     samples = audio_decoder.get_all_samples()
     waveform = samples.data.mean(dim=0)  # downmix to mono
     if samples.sample_rate != TARGET_SAMPLE_RATE:
@@ -130,6 +154,20 @@ def waveform_to_16k_mono(audio_decoder) -> np.ndarray:
 
 
 def load_and_prepare_data(args, feature_extractor):
+    """Load ESC-50, carve out an eval split, and wire up on-the-fly feature extraction.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `eval_fraction`,
+            `seed`, `max_samples`, `sample_selection`, and `max_eval_samples`.
+        feature_extractor: A Hugging Face `AutoFeatureExtractor` instance
+            used to turn raw waveforms into model input features.
+
+    Returns:
+        tuple: `(train_dataset, eval_dataset, class_names)` where the first
+        two are `datasets.Dataset` objects with a lazy `with_transform`
+        feature-extraction pipeline attached, and `class_names` is the
+        sorted list of category names indexed by class id.
+    """
     print_banner("LOADING DATASET")
     full = load_dataset(DATASET_NAME, split="train")
 
@@ -144,6 +182,7 @@ def load_and_prepare_data(args, feature_extractor):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def transform(examples):
+        """Batch-transform raw audio examples into model-ready features and labels."""
         waveforms = [waveform_to_16k_mono(audio) for audio in examples["audio"]]
         encoding = feature_extractor(waveforms, sampling_rate=TARGET_SAMPLE_RATE, return_tensors="pt")
         return {"input_values": encoding["input_values"], "labels": examples["target"]}
@@ -158,12 +197,28 @@ def load_and_prepare_data(args, feature_extractor):
 
 
 def collate_fn(batch):
+    """Stack a list of per-example feature dicts into a batched tensor dict.
+
+    Args:
+        batch (list[dict]): Examples, each with fixed-shape `input_values`
+            and an integer `labels` value.
+
+    Returns:
+        dict: `{"input_values": Tensor, "labels": Tensor}` batched tensors.
+    """
     input_values = torch.stack([item["input_values"] for item in batch])  # AST's feature extractor always returns a fixed (1024, 128) shape -- no variable-length padding needed, unlike raw-waveform models
     labels = torch.tensor([item["labels"] for item in batch])
     return {"input_values": input_values, "labels": labels}
 
 
 def print_formatted_examples_audio(dataset, class_names, num_examples: int = 2) -> None:
+    """Print a few dataset examples' feature shapes and labels for manual inspection.
+
+    Args:
+        dataset: A dataset with `__getitem__` returning transformed examples.
+        class_names (list[str]): Class names indexed by label id.
+        num_examples (int): Number of examples to print. Default: 2.
+    """
     print_banner("FORMATTED EXAMPLES")
     for i in range(min(num_examples, len(dataset))):
         example = dataset[i]
@@ -174,6 +229,14 @@ def print_formatted_examples_audio(dataset, class_names, num_examples: int = 2) 
 
 
 def compute_metrics(eval_pred):
+    """Compute accuracy, macro F1, precision, and recall for a Trainer eval pass.
+
+    Args:
+        eval_pred (tuple): `(logits, labels)` as passed by `transformers.Trainer`.
+
+    Returns:
+        dict: Metric name to float value.
+    """
     logits, labels = eval_pred
     predictions = np.argmax(logits, axis=-1)
     return {
@@ -185,6 +248,7 @@ def compute_metrics(eval_pred):
 
 
 def main():
+    """Run the end-to-end audio classification SFT pipeline: load data, fine-tune AST, evaluate, save."""
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Audio classification SFT (AST)")

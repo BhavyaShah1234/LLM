@@ -54,6 +54,13 @@ CLASS_NAMES = ["Coverall", "Face_Shield", "Gloves", "Goggles", "Mask"]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for this training script.
+
+    Returns:
+        argparse.ArgumentParser: Parser covering model choice, image resize
+        bounds, optimization hyperparameters, sample selection, output
+        paths, and debug/seed flags.
+    """
     p = argparse.ArgumentParser(description="SFT a DETR object detector.")
 
     p.add_argument("--model", type=str, default="facebook/detr-resnet-50", help="DETR checkpoint. Default: facebook/detr-resnet-50 (fp32 ~160MB).")
@@ -85,6 +92,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def verify_dataset() -> None:
+    """Stream-peek one example from the dataset and assert the expected fields exist.
+
+    Prints the fields and one sample's image size/object count/categories.
+    Not called from `main()` (see the comment there) but kept for manual
+    verification runs.
+    """
     print_banner("VERIFYING DATASET")
     peek = load_dataset(DATASET_NAME, split="train", streaming=True)
     example = next(iter(peek))
@@ -97,6 +110,16 @@ def verify_dataset() -> None:
 
 
 def to_coco_annotations(example):
+    """Convert one dataset example's `objects` field into COCO-style detection annotations.
+
+    Args:
+        example (dict): A raw dataset example with `image_id` and an
+            `objects` dict of parallel `category`/`bbox`/`area` lists.
+
+    Returns:
+        dict: `{"image_id": ..., "annotations": [...]}` in the COCO
+        annotation format expected by `AutoImageProcessor`.
+    """
     objects = example["objects"]
     annotations = [
         {"image_id": example["image_id"], "category_id": cat, "bbox": bbox, "area": area, "iscrowd": 0}
@@ -106,6 +129,18 @@ def to_coco_annotations(example):
 
 
 def load_and_prepare_data(args, processor):
+    """Load the CPPE-5 train/test splits and wire up on-the-fly image/annotation preprocessing.
+
+    Args:
+        args (argparse.Namespace): Parsed CLI args; uses `max_samples`,
+            `sample_selection`, `max_eval_samples`, and `seed`.
+        processor: A Hugging Face `AutoImageProcessor` instance used to
+            resize images and encode COCO-style annotations for DETR.
+
+    Returns:
+        tuple: `(train_dataset, eval_dataset)`, `datasets.Dataset` objects
+        with a lazy `with_transform` preprocessing pipeline attached.
+    """
     print_banner("LOADING DATASET")
     train_raw = load_dataset(DATASET_NAME, split="train")
     eval_raw = load_dataset(DATASET_NAME, split="test")
@@ -114,6 +149,7 @@ def load_and_prepare_data(args, processor):
     eval_raw = select_samples(eval_raw, args.max_eval_samples, "first", args.seed)
 
     def transform(examples):
+        """Batch-transform raw images and COCO annotations into model-ready pixel values and labels."""
         images = [img.convert("RGB") for img in examples["image"]]
         targets = [to_coco_annotations(dict(zip(examples.keys(), vals))) for vals in zip(*examples.values())]
         encoding = processor(images=images, annotations=targets, return_tensors="pt")
@@ -129,6 +165,16 @@ def load_and_prepare_data(args, processor):
 
 
 def collate_fn(batch):
+    """Right/bottom zero-pad a batch of variable-sized images to a common size and build a pixel mask.
+
+    Args:
+        batch (list[dict]): Examples, each with a `pixel_values` tensor of
+            possibly differing (C, H, W) and a `labels` dict.
+
+    Returns:
+        dict: `{"pixel_values": Tensor, "pixel_mask": Tensor, "labels": list}`
+        where `pixel_mask` marks real (1) vs. padded (0) pixels.
+    """
     # Manual batch padding: this transformers version's DetrImageProcessor.pad()
     # signature changed to operate on a SINGLE image (image, padded_size, ...), not a
     # batch with a return_tensors kwarg -- confirmed via a live TypeError, and via
@@ -156,6 +202,12 @@ def collate_fn(batch):
 
 
 def print_formatted_examples_detection(dataset, num_examples: int = 2) -> None:
+    """Print a few dataset examples' pixel shapes and detected box classes for manual inspection.
+
+    Args:
+        dataset: A dataset with `__getitem__` returning transformed examples.
+        num_examples (int): Number of examples to print. Default: 2.
+    """
     print_banner("FORMATTED EXAMPLES")
     for i in range(min(num_examples, len(dataset))):
         example = dataset[i]
@@ -168,6 +220,7 @@ def print_formatted_examples_detection(dataset, num_examples: int = 2) -> None:
 
 
 def main():
+    """Run the end-to-end object detection SFT pipeline: load data, fine-tune DETR, evaluate, save."""
     args = build_arg_parser().parse_args()
     set_all_seeds(args.seed)
     print_config(args, "Object detection SFT (DETR)")
