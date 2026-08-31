@@ -68,6 +68,46 @@ def build_model_from_scratch(
     return model
 
 
+def load_model_from_checkpoint(
+    architecture_family: str,
+    model_name: str,
+    gradient_checkpointing: bool = True,
+    torch_dtype: torch.dtype = torch.bfloat16,
+) -> PreTrainedModel:
+    """Load a previously-trained checkpoint matching `architecture_family`.
+
+    Unlike `build_model_from_scratch` (random init), this loads real weights
+    via `from_pretrained` -- used to continue training an already-pretrained
+    checkpoint (e.g. resuming pretraining/ for more epochs) rather than
+    starting over.
+
+    Args:
+        architecture_family (str): One of "decoder-only", "encoder-only", or
+            "encoder-decoder"; selects which AutoModel class to instantiate.
+        model_name (str): Local path or HF Hub id of the checkpoint to load.
+        gradient_checkpointing (bool): Whether to enable gradient
+            checkpointing on the loaded model.
+        torch_dtype (torch.dtype): Compute dtype to load weights in.
+
+    Returns:
+        PreTrainedModel: The loaded model, ready for further training.
+
+    Raises:
+        ValueError: If `architecture_family` isn't a recognized key.
+    """
+    try:
+        automodel_cls = _ARCHITECTURE_TO_AUTOMODEL[architecture_family]
+    except KeyError:
+        raise ValueError(
+            f"Unknown architecture_family {architecture_family!r}; "
+            f"expected one of {sorted(_ARCHITECTURE_TO_AUTOMODEL)}"
+        )
+    model = automodel_cls.from_pretrained(model_name, dtype=torch_dtype)
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    return model
+
+
 def load_tokenizer(model_name: str, use_fast: bool = True, ensure_pad_token: bool = True) -> PreTrainedTokenizerBase:
     """Load a tokenizer from a local path or HF Hub id.
 

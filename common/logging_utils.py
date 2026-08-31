@@ -8,7 +8,9 @@ skim any script's output and immediately recognize the structure.
 """
 
 import argparse
-from typing import Callable, Optional
+import datetime
+import os
+from typing import Callable, List, Optional, Tuple
 
 
 def print_banner(title: str, width: int = 80) -> None:
@@ -37,6 +39,40 @@ def print_config(args: argparse.Namespace, task_description: str) -> None:
     for key, value in sorted(vars(args).items()):
         print(f"  {key}: {value}")
     print()
+
+
+def log_generation_samples(
+    output_dir: str,
+    stage_label: str,
+    samples: List[Tuple[str, str]],
+    filename: str = "sample_generations.txt",
+) -> str:
+    """Append a labeled block of qualitative generation samples to a log file.
+
+    Used by pretraining/ scripts to record what the model produces before
+    and after each training stage, so progress across an overnight chain of
+    resumed runs can be inspected as plain text afterward.
+
+    Args:
+        output_dir (str): Directory to write/append the log file into
+            (created if missing).
+        stage_label (str): Short label for this block (e.g. "before
+            training", "after epochs 0-10").
+        samples (List[Tuple[str, str]]): `(prompt, output)` pairs to log.
+        filename (str): Log file name within `output_dir`.
+
+    Returns:
+        str: The path to the appended log file.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, filename)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with open(path, "a") as f:
+        f.write(f"\n{'=' * 80}\n{stage_label}  ({timestamp})\n{'=' * 80}\n")
+        for prompt, output in samples:
+            f.write(f"\n--- Prompt/input ---\n{prompt}\n--- Output ---\n{output}\n")
+    print(f"[generation_log] appended to {path}")
+    return path
 
 
 def print_formatted_examples(

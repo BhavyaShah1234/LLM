@@ -19,6 +19,7 @@ import argparse
 import math
 import time
 
+import torch
 from datasets import load_dataset
 from transformers import (
     DataCollatorForLanguageModeling,
@@ -28,8 +29,8 @@ from transformers import (
 )
 
 from common.data_selection import select_samples
-from common.logging_utils import print_banner, print_config, print_formatted_examples
-from common.model_loading import build_model_from_scratch, load_tokenizer
+from common.logging_utils import log_generation_samples, print_banner, print_config, print_formatted_examples
+from common.model_loading import build_model_from_scratch, load_model_from_checkpoint, load_tokenizer
 from common.model_saving import save_model
 from common.run_results import write_run_result
 from common.seeding import set_all_seeds
@@ -37,6 +38,11 @@ from common.seeding import set_all_seeds
 DATASET_NAME = "roneneldan/TinyStories"
 TOKENIZER_NAME = "gpt2"
 ARCHITECTURE = "decoder-only"
+
+DEMO_PROMPTS = [
+    "Once upon a time, there was a little girl who",
+    "The dog ran into the garden and saw a",
+]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -67,6 +73,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--warmup_steps", type=int, default=200, help="LR warmup steps. Default: 200.")
     p.add_argument("--epochs", type=float, default=1.0, help="Number of training epochs over the (possibly truncated) train split. Ignored if --max_steps is set. Default: 1.0.")
     p.add_argument("--max_steps", type=int, default=-1, help="If set (>0), overrides --epochs and stops after this many optimizer steps. Default: -1 (unset, use --epochs).")
+    p.add_argument("--init_from", type=str, default=None, help="Path to a previously-saved checkpoint from this script (i.e. a prior --output_dir) to continue training instead of random-initializing. Runs as a fresh Trainer run (its own optimizer/LR schedule) for --epochs more epochs on top of that checkpoint's weights. Default: None (random init from scratch).")
+    p.add_argument("--stage_label", type=str, default="from scratch", help="Human-readable label for this training stage, used only in the sample_generations.txt log (e.g. 'epochs 10-20'). Default: 'from scratch'.")
 
     # System
     p.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"], help="Mixed precision mode. Default: bf16.")
@@ -75,7 +83,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--output_dir", type=str, default="./output/pretraining/clm", help="Where to save the trained model, tokenizer, and run_result.json.")
     p.add_argument("--logging_steps", type=int, default=25, help="Logging frequency. Default: 25.")
     p.add_argument("--eval_steps", type=int, default=250, help="Evaluation frequency. Default: 250.")
-    p.add_argument("--save_steps", type=int, default=500, help="Checkpoint save frequency. Default: 500.")
 
     # Debugging
     p.add_argument("--debug_first_batch", action="store_true", default=False, help="Load data, build the model, print formatted examples and the model's real parameter count, then exit without training.")
@@ -182,18 +189,29 @@ def load_and_prepare_data(args, tokenizer):
 
 
 def build_model(args, tokenizer):
-    """Construct a randomly initialized GPT2-style model sized by CLI args.
+    """Construct the model to train: a fresh random-init GPT2-style model, or
+    a reload of a prior checkpoint when --init_from is set.
 
     Args:
         args (argparse.Namespace): Parsed CLI args; uses hidden_size,
-            num_layers, num_attention_heads, block_size, and
-            gradient_checkpointing.
+            num_layers, num_attention_heads, block_size,
+            gradient_checkpointing, and init_from.
         tokenizer: Tokenizer used to size the vocabulary and set special
-            token ids.
+            token ids (only relevant for the random-init path).
 
     Returns:
-        transformers.PreTrainedModel: Freshly initialized decoder-only model.
+        transformers.PreTrainedModel: The model to train, either freshly
+        initialized or loaded from --init_from.
     """
+    if args.init_from:
+        print_banner("MODEL (RESUMED FROM CHECKPOINT)")
+        print(f"Loading from: {args.init_from}")
+        model = load_model_from_checkpoint(ARCHITECTURE, args.init_from, gradient_checkpointing=args.gradient_checkpointing)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Total parameters: {total_params:,}")
+        print()
+        return model
+
     config = GPT2Config(
         vocab_size=len(tokenizer),
         n_positions=args.block_size,
@@ -215,6 +233,36 @@ def build_model(args, tokenizer):
     print(f"Non-embedding params:  {total_params - embedding_params:,}")
     print()
     return model
+
+
+def generate_demo_samples(model, tokenizer):
+    """Greedily generate short continuations for a few fixed prompts.
+
+    Used to show qualitative before/after differences across training
+    stages; not used for any metric.
+
+    Args:
+        model: The (decoder-only) model to generate with.
+        tokenizer: Tokenizer to encode prompts and decode outputs.
+
+    Returns:
+        list[tuple[str, str]]: `(prompt, generated_text)` pairs.
+    """
+    model.eval()
+    samples = []
+    for prompt in DEMO_PROMPTS:
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=60,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            )
+        text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        samples.append((prompt, text))
+    model.train()
+    return samples
 
 
 def decode_example(example, index, tokenizer):
@@ -256,6 +304,12 @@ def main():
         print("--debug_first_batch set: exiting without training.")
         return
 
+    print_banner("SAMPLE GENERATIONS (BEFORE THIS STAGE)")
+    before_samples = generate_demo_samples(model, tokenizer)
+    for prompt, text in before_samples:
+        print(f"  Prompt: {prompt!r}\n  -> {text!r}\n")
+    log_generation_samples(args.output_dir, f"BEFORE stage {args.stage_label!r}", before_samples)
+
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     training_args = TrainingArguments(
@@ -274,9 +328,7 @@ def main():
         logging_steps=args.logging_steps,
         eval_strategy="steps",
         eval_steps=args.eval_steps,
-        save_strategy="steps",
-        save_steps=args.save_steps,
-        save_total_limit=2,
+        save_strategy="no",  # resuming goes through --init_from (a full save_model() at the end of each stage), not Trainer's own mid-training checkpoints, which would otherwise duplicate disk usage (weights + optimizer/scheduler state) every stage for no benefit
         seed=args.seed,
         report_to=[],
     )
@@ -300,6 +352,12 @@ def main():
     perplexity = math.exp(eval_loss) if eval_loss < 20 else float("inf")
     print(f"Eval loss: {eval_loss:.4f}  |  Perplexity: {perplexity:.2f}")
 
+    print_banner("SAMPLE GENERATIONS (AFTER THIS STAGE)")
+    after_samples = generate_demo_samples(model, tokenizer)
+    for prompt, text in after_samples:
+        print(f"  Prompt: {prompt!r}\n  -> {text!r}\n")
+    log_generation_samples(args.output_dir, f"AFTER stage {args.stage_label!r}", after_samples)
+
     save_model(model, tokenizer, args.output_dir, strategy="full")
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -312,7 +370,7 @@ def main():
         model_name=f"from-scratch-gpt2-style-{total_params}params",
         dataset_name=DATASET_NAME,
         hyperparameters=vars(args),
-        metrics={"eval_loss": eval_loss, "perplexity": perplexity, "total_parameters": total_params},
+        metrics={"eval_loss": eval_loss, "perplexity": perplexity, "total_parameters": total_params, "stage_label": args.stage_label},
         num_train_samples=len(train_dataset),
         num_eval_samples=len(eval_dataset),
         train_runtime_seconds=train_runtime_seconds,
