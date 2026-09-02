@@ -29,5 +29,6 @@ compare have already been produced by the relevant stage's scripts.
 | `rlhf-pretrained-vs-sft-init/` | **done (Wave 4)** | `rlhf/grpo/` (Wave 4, done) |
 | `qat-vs-ptq-inference/` | **done (Wave 4)** | `optimization/{training/memory/quantization-aware-training,inference/memory/post-training-quantization}/` (Wave 4, done) |
 | `quantized-training-vs-quantized-inference/` | **done (Wave 5)** | `supervised-finetuning/text/mcq/decoder-only/mcq_standard.py` (done) |
+| `lora-vs-full-domain-adaptation/` | **planned** | `domain-adaptation/domain_adaptation.py` (done), `supervised-finetuning/text/mcq/decoder-only/mcq_standard.py` (done) |
 
 See each subfolder's `README.md` for its specific question and protocol.

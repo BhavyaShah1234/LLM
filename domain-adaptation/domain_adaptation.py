@@ -20,13 +20,24 @@ ingestion.
 Since this project's model-selection philosophy defaults to a small-but-real
 1.7B model here (unlike continued_pretraining.py's toy from-scratch
 checkpoint), full-parameter training does not fit in 8GB VRAM -- confirmed
-empirically while building supervised-finetuning/ (see its README)  --
-`--lora` (optionally with `--quantization 4bit`) is the realistic default
-for this script, same as every supervised-finetuning/ decoder-only script.
+empirically while building supervised-finetuning/ (see its README) -- so
+LoRA (adapter weights only) is the *default* here, same as every
+supervised-finetuning/ decoder-only script. `--full_finetune` opts into
+updating the base model's own weights instead, matching the original
+Domain-Adaptive Pretraining (DAPT) literature (Gururangan et al. 2020,
+"Don't Stop Pretraining"), which predates LoRA and does full-parameter
+continued pretraining -- LoRA-based domain adaptation is a later,
+resource-efficient variant of the same idea, not the canonical approach.
+`--full_finetune` is NOT expected to fit in 8GB VRAM at this model size
+without further mitigation (see its help text for what's available); it
+exists so the two approaches -- base-weight vs. LoRA-weight domain
+adaptation -- can be compared, on hardware where it fits, per
+experiments/lora-vs-full-domain-adaptation/.
 
 Usage:
     python domain_adaptation.py --debug_first_batch --max_samples 20
-    python domain_adaptation.py --lora --max_samples 2000
+    python domain_adaptation.py --max_samples 2000
+    python domain_adaptation.py --full_finetune --optimizer paged_adamw_8bit --batch_size 1 --max_samples 2000
 """
 
 import argparse
@@ -59,13 +70,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Domain-adapt a decoder-only checkpoint (CLM objective) to medical text.")
 
     p.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B-Base", help="Base checkpoint to domain-adapt. Default: Qwen/Qwen3-1.7B-Base.")
-    p.add_argument("--quantization", type=str, default="no", choices=["no", "4bit", "8bit"], help="Quantization for loading. Default: no (use 4bit alongside --lora if VRAM is tight).")
+    p.add_argument("--quantization", type=str, default="no", choices=["no", "4bit", "8bit"], help="Quantization for loading. Default: no (use 4bit if VRAM is tight; only meaningful with LoRA -- see --full_finetune).")
 
-    p.add_argument("--lora", action="store_true", default=False, help="Enable LoRA. Recommended: full-parameter CLM training of this model doesn't fit in 8GB (confirmed empirically).")
-    p.add_argument("--lora_r", type=int, default=16, help="LoRA rank. Default: 16.")
-    p.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha. Default: 32.")
-    p.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout. Default: 0.05.")
-    p.add_argument("--lora_target_modules", type=str, default="q_proj,k_proj,v_proj,o_proj", help="Comma-separated LoRA target modules.")
+    p.add_argument("--full_finetune", action="store_true", default=False, help="Update all base model weights instead of a LoRA adapter -- the canonical DAPT approach, matching the claim that domain adaptation modifies the base weights rather than an adapter. WARNING: full-parameter CLM training of Qwen3-1.7B-Base is confirmed to OOM on this project's 8GB VRAM budget with default settings (see supervised-finetuning/README.md). Combine with --optimizer paged_adamw_8bit, --batch_size 1, and a small --max_samples to have a chance of fitting; may still not fit without further mitigation (e.g. DeepSpeed ZeRO offload, not wired into this script). Default: off (LoRA, the practical default on this hardware).")
+    p.add_argument("--optimizer", type=str, default="adamw_torch", choices=["adamw_torch", "paged_adamw_8bit"], help="Optimizer. paged_adamw_8bit (bitsandbytes) uses ~4x less optimizer-state memory than the default -- most useful alongside --full_finetune, where optimizer state is the dominant memory cost. Default: adamw_torch.")
+    p.add_argument("--lora_r", type=int, default=16, help="LoRA rank. Default: 16. Ignored with --full_finetune.")
+    p.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha. Default: 32. Ignored with --full_finetune.")
+    p.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout. Default: 0.05. Ignored with --full_finetune.")
+    p.add_argument("--lora_target_modules", type=str, default="q_proj,k_proj,v_proj,o_proj", help="Comma-separated LoRA target modules. Ignored with --full_finetune.")
 
     p.add_argument("--block_size", type=int, default=256, help="Context length in tokens per packed training example. Default: 256.")
     p.add_argument("--max_samples", type=int, default=-1, help="Number of raw dataset rows (explanations) to use before packing. -1 (default) = use the full split.")
@@ -87,7 +99,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--logging_steps", type=int, default=10, help="Logging frequency. Default: 10.")
     p.add_argument("--eval_steps", type=int, default=100, help="Evaluation frequency. Default: 100.")
     p.add_argument("--save_steps", type=int, default=200, help="Checkpoint save frequency. Default: 200.")
-    p.add_argument("--save_strategy", type=str, default="adapter_only", choices=["full", "adapter_only", "merged", "adapter_and_merged", "base_reference"], help="Model saving strategy (see common/model_saving.py). Default: adapter_only when --lora, otherwise 'full'.")
+    p.add_argument("--save_strategy", type=str, default="adapter_only", choices=["full", "adapter_only", "merged", "adapter_and_merged", "base_reference"], help="Model saving strategy (see common/model_saving.py) when using LoRA. Ignored (always 'full') with --full_finetune. Default: adapter_only.")
 
     p.add_argument("--debug_first_batch", action="store_true", default=False, help="Print formatted examples and exit without training.")
 
@@ -219,6 +231,9 @@ def main():
     run_result.json.
     """
     args = build_arg_parser().parse_args()
+    use_lora = not args.full_finetune
+    if args.full_finetune and args.quantization != "no":
+        raise ValueError("--quantization is only meaningful with LoRA (a quantized base can't be updated by ordinary full-parameter backprop); drop --quantization to use --full_finetune.")
     set_all_seeds(args.seed)
     print_config(args, "Domain adaptation (decoder-only, CLM) -- specializing to medical text")
 
@@ -241,7 +256,7 @@ def main():
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
-    if args.lora:
+    if use_lora:
         from common.peft_setup import apply_lora, build_lora_config
 
         lora_config = build_lora_config(args.lora_r, args.lora_alpha, args.lora_dropout, args.lora_target_modules)
@@ -250,6 +265,7 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print_banner("MODEL")
     print(f"Domain-adapting: {args.model}")
+    print(f"Mode: {'full-parameter (base weights updated)' if not use_lora else 'LoRA (adapter weights only)'}")
     print(f"Total parameters: {total_params:,}")
     print()
 
@@ -273,6 +289,7 @@ def main():
         bf16=(args.mixed_precision == "bf16"),
         fp16=(args.mixed_precision == "fp16"),
         gradient_checkpointing=args.gradient_checkpointing,
+        optim=args.optimizer,
         logging_steps=args.logging_steps,
         eval_strategy="steps",
         eval_steps=args.eval_steps,
@@ -281,7 +298,7 @@ def main():
         save_total_limit=2,
         seed=args.seed,
         report_to=[],
-        ddp_find_unused_parameters=(True if args.lora else None),
+        ddp_find_unused_parameters=(True if use_lora else None),
     )
 
     trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
@@ -297,8 +314,8 @@ def main():
     perplexity = math.exp(eval_loss) if eval_loss < 20 else float("inf")
     print(f"Eval loss: {eval_loss:.4f}  |  Perplexity: {perplexity:.2f}")
 
-    save_strategy = args.save_strategy if args.lora else "full"
-    save_model(model, tokenizer, args.output_dir, strategy=save_strategy, base_model_name=args.model, is_lora=args.lora)
+    save_strategy = args.save_strategy if use_lora else "full"
+    save_model(model, tokenizer, args.output_dir, strategy=save_strategy, base_model_name=args.model, is_lora=use_lora)
 
     write_run_result(
         output_dir=args.output_dir,

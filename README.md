@@ -616,7 +616,7 @@ them is one of this project's original motivating questions.
 - [`ability-training/README.md`](ability-training/README.md) — done (Wave 4)
 - [`optimization/README.md`](optimization/README.md) — done (Waves 4-6) — full taxonomy, 11 real scripts
 - [`production/README.md`](production/README.md) — done (Wave 4)
-- [`experiments/README.md`](experiments/README.md) — 6 real, 0 planned
+- [`experiments/README.md`](experiments/README.md) — 6 real, 1 planned
 
 ---
 
